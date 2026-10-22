@@ -27,11 +27,25 @@ object FirebaseInitializer {
             val existingApps = FirebaseApp.getApps(context)
             if (existingApps.isNotEmpty()) {
                 val app = existingApps.firstOrNull()
-                AppLogger.i(TAG, "FirebaseApp is already active: ${app?.name}")
-                AppState.firebaseInitialized = true
-                AppState.firebaseInitError = null
-                configureFirestorePersistence()
-                return true
+                if (app != null) {
+                    val opts = app.options
+                    val isKeyValid = opts.apiKey.isNotBlank() && !opts.apiKey.contains("remix", ignoreCase = true)
+                    val isProjectValid = opts.projectId.equals(FALLBACK_PROJECT_ID, ignoreCase = true)
+                    if (isKeyValid && isProjectValid) {
+                        AppLogger.i(TAG, "FirebaseApp is already active with valid credentials: ${app.name}")
+                        AppState.firebaseInitialized = true
+                        AppState.firebaseInitError = null
+                        configureFirestorePersistence()
+                        return true
+                    } else {
+                        AppLogger.w(TAG, "Existing FirebaseApp had invalid or remixed options (project=${opts.projectId}). Purging stale instance...")
+                        try {
+                            app.delete()
+                        } catch (e: Exception) {
+                            AppLogger.w(TAG, "Failed to delete invalid app: ${e.message}")
+                        }
+                    }
+                }
             }
 
             AppLogger.i(TAG, "Initializing FirebaseApp for package: ${context.packageName}")
@@ -40,6 +54,16 @@ object FirebaseInitializer {
             var app: FirebaseApp? = null
             try {
                 app = FirebaseApp.initializeApp(context)
+                if (app != null) {
+                    val opts = app.options
+                    val isKeyValid = opts.apiKey.isNotBlank() && !opts.apiKey.contains("remix", ignoreCase = true)
+                    val isProjectValid = opts.projectId.equals(FALLBACK_PROJECT_ID, ignoreCase = true)
+                    if (!isKeyValid || !isProjectValid) {
+                        AppLogger.w(TAG, "Standard FirebaseApp.initializeApp produced invalid/remixed options. Discarding...")
+                        try { app.delete() } catch (_: Exception) {}
+                        app = null
+                    }
+                }
             } catch (e: Exception) {
                 AppLogger.w(TAG, "Standard FirebaseApp.initializeApp threw: ${e.message}")
             }
@@ -52,14 +76,14 @@ object FirebaseInitializer {
                 return true
             }
 
-            AppLogger.w(TAG, "Standard initialization returned null or empty apps. Falling back to explicit FirebaseOptions...")
+            AppLogger.w(TAG, "Standard initialization returned null, empty apps, or remixed credentials. Falling back to explicit FirebaseOptions...")
 
-            // Step 2: Read resources with cross-package fallback (checking current package and namespace com.example)
-            val appId = resolveResource(context, "google_app_id") ?: FALLBACK_APP_ID
-            val apiKey = resolveResource(context, "google_api_key") ?: FALLBACK_API_KEY
-            val projectId = resolveResource(context, "project_id") ?: FALLBACK_PROJECT_ID
-            val storageBucket = resolveResource(context, "google_storage_bucket") ?: FALLBACK_STORAGE_BUCKET
-            val gcmSenderId = resolveResource(context, "gcm_defaultSenderId") ?: FALLBACK_GCM_SENDER_ID
+            // Step 2: Read resources with cross-package fallback, filtering out any remixed or blank values
+            val appId = resolveResource(context, "google_app_id")?.takeIf { it.isNotBlank() && !it.contains("remix", ignoreCase = true) } ?: FALLBACK_APP_ID
+            val apiKey = resolveResource(context, "google_api_key")?.takeIf { it.isNotBlank() && !it.contains("remix", ignoreCase = true) } ?: FALLBACK_API_KEY
+            val projectId = resolveResource(context, "project_id")?.takeIf { it.isNotBlank() && !it.contains("remix", ignoreCase = true) } ?: FALLBACK_PROJECT_ID
+            val storageBucket = resolveResource(context, "google_storage_bucket")?.takeIf { it.isNotBlank() && !it.contains("remix", ignoreCase = true) } ?: FALLBACK_STORAGE_BUCKET
+            val gcmSenderId = resolveResource(context, "gcm_defaultSenderId")?.takeIf { it.isNotBlank() && !it.contains("remix", ignoreCase = true) } ?: FALLBACK_GCM_SENDER_ID
 
             AppLogger.i(TAG, "Configuring FirebaseOptions with AppID: $appId, ProjectID: $projectId")
 
