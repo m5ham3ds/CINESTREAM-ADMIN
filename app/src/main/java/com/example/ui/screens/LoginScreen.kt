@@ -341,9 +341,8 @@ fun LoginScreen(
 
                     Spacer(modifier = Modifier.height(20.dp))
 
-                    // Explicit Google sign-in must use GetSignInWithGoogleOption. GetGoogleIdOption
-                    // is the ambient/One Tap flow and can fail with NoCredentialException on devices
-                    // where there is no previously authorized Google credential available.
+                    // Explicit Google sign-in must use GetSignInWithGoogleOption. Unlike GetGoogleIdOption where
+                    // setAutoSelectEnabled(false) is needed, GetSignInWithGoogleOption is strictly explicit by design.
                     CineStreamOutlinedLoadingButton(
                         onClick = {
                             val activity = context.findActivity()
