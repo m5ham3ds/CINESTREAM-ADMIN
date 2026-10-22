@@ -32,15 +32,17 @@ class AdminRepository {
         }
     }
 
-    private val auth: FirebaseAuth by lazy {
-        ensureFirebase()
-        FirebaseAuth.getInstance()
-    }
+    private val auth: FirebaseAuth
+        get() {
+            ensureFirebase()
+            return FirebaseAuth.getInstance()
+        }
 
-    private val firestore: FirebaseFirestore by lazy {
-        ensureFirebase()
-        FirebaseFirestore.getInstance()
-    }
+    private val firestore: FirebaseFirestore
+        get() {
+            ensureFirebase()
+            return FirebaseFirestore.getInstance()
+        }
 
     private val usersCollection get() = firestore.collection(FirebaseCollections.USERS)
     private val adminsCollection get() = firestore.collection(FirebaseCollections.ADMINS)

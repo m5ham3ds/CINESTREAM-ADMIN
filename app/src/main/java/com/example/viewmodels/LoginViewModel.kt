@@ -28,7 +28,8 @@ data class LoginUiState(
 )
 
 class LoginViewModel(private val repository: AdminRepository = AdminRepository()) : ViewModel() {
-    private val auth by lazy { FirebaseAuth.getInstance() }
+    val auth: FirebaseAuth get() = FirebaseAuth.getInstance()
+    fun getAuthInstance(): FirebaseAuth = auth
     
     private val _uiState = MutableStateFlow(LoginUiState())
     val uiState = _uiState.asStateFlow()

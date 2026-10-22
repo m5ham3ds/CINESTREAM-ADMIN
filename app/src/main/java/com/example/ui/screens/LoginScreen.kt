@@ -62,6 +62,22 @@ import com.example.viewmodels.LoginViewModel
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import kotlinx.coroutines.launch
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.widget.Toast
+import com.example.AppState
+import com.example.BuildConfig
+import com.google.firebase.FirebaseApp
+import com.google.firebase.auth.FirebaseAuth
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Warning
 
 private fun Context.findActivity(): Activity? {
     var current: Context = this
@@ -414,6 +430,11 @@ fun LoginScreen(
                 }
             }
 
+            if (BuildConfig.DEBUG) {
+                Spacer(modifier = Modifier.height(16.dp))
+                DebugFirebaseDiagnosticCard(viewModel = viewModel)
+            }
+
             Spacer(modifier = Modifier.height(24.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Security, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(14.dp))
@@ -468,4 +489,372 @@ fun CustomTextField(
         ),
         singleLine = true
     )
+}
+
+data class FirebaseRuntimeDiagnostics(
+    val buildApplicationId: String,
+    val runtimePackageName: String,
+    val isPackageMatched: Boolean,
+    val buildType: String,
+    val versionName: String,
+    val versionCode: Int,
+    val activeFirebaseAppName: String,
+    val isDefaultAppInitialized: Boolean,
+    val totalAppsCount: Int,
+    val runtimeProjectId: String,
+    val runtimeApplicationId: String,
+    val vmAuthAppName: String,
+    val vmAuthProjectId: String,
+    val vmAuthApplicationId: String,
+    val isVmAuthUsingDefaultApp: Boolean,
+    val isFirebaseInitializerSuccess: Boolean,
+    val firebaseInitError: String?,
+    val isApiKeyPresent: Boolean,
+    val hasAizaPrefix: Boolean,
+    val hasPlaceholderFragment: Boolean,
+    val isGeneratedResKeyPresent: Boolean,
+    val doesKeyMatchGeneratedResource: Boolean,
+    val keySha256Short: String,
+    val resKeySha256Short: String,
+    val generatedAppId: String,
+    val isAppIdMatchingGenerated: Boolean,
+    val generatedProjectId: String,
+    val isProjectIdMatchingExpected: Boolean,
+    val isConfigurationDivergent: Boolean
+)
+
+@Composable
+fun rememberFirebaseRuntimeDiagnostics(
+    viewModel: LoginViewModel,
+    refreshTrigger: Int
+): FirebaseRuntimeDiagnostics {
+    val context = LocalContext.current
+    return remember(refreshTrigger) {
+        val buildAppId = BuildConfig.APPLICATION_ID
+        val pkgName = context.packageName
+        val isPkgMatch = buildAppId == pkgName
+        val bType = BuildConfig.BUILD_TYPE
+        val vName = BuildConfig.VERSION_NAME
+        val vCode = BuildConfig.VERSION_CODE
+
+        val defaultApp = try { FirebaseApp.getInstance() } catch (_: Exception) { null }
+        val appsList = try { FirebaseApp.getApps(context) } catch (_: Exception) { emptyList<FirebaseApp>() }
+        val defaultAppName = defaultApp?.name ?: "None (Uninitialized)"
+        val defaultOptions = defaultApp?.options
+
+        val runtimeProjId = defaultOptions?.projectId ?: "N/A"
+        val runtimeAppId = defaultOptions?.applicationId ?: "N/A"
+        val runtimeApiKey = defaultOptions?.apiKey ?: ""
+
+        val vmAuth = try { viewModel.getAuthInstance() } catch (_: Exception) { null }
+        val vmAuthApp = try { vmAuth?.app } catch (_: Exception) { null }
+        val vmAuthAppName = vmAuthApp?.name ?: "N/A"
+        val vmAuthProjId = vmAuthApp?.options?.projectId ?: "N/A"
+        val vmAuthAppId = vmAuthApp?.options?.applicationId ?: "N/A"
+        val isVmAuthDefault = vmAuthApp != null && defaultApp != null && vmAuthApp == defaultApp
+
+        val isInitSuccess = AppState.firebaseInitialized
+        val initError = AppState.firebaseInitError
+
+        val resKeyId = context.resources.getIdentifier("google_api_key", "string", context.packageName)
+        val resApiKey = if (resKeyId != 0) try { context.getString(resKeyId) } catch (_: Exception) { null } else null
+
+        val resAppIdRes = context.resources.getIdentifier("google_app_id", "string", context.packageName)
+        val resAppId = if (resAppIdRes != 0) try { context.getString(resAppIdRes) } catch (_: Exception) { null } else null
+
+        val resProjIdRes = context.resources.getIdentifier("project_id", "string", context.packageName)
+        val resProjId = if (resProjIdRes != 0) try { context.getString(resProjIdRes) } catch (_: Exception) { null } else null
+
+        fun computeSha256Prefix(value: String?): String {
+            if (value.isNullOrBlank()) return "N/A"
+            return try {
+                val md = MessageDigest.getInstance("SHA-256")
+                val digest = md.digest(value.trim().toByteArray(Charsets.UTF_8))
+                digest.joinToString("") { "%02x".format(it) }.take(8)
+            } catch (_: Exception) {
+                "ERR"
+            }
+        }
+
+        val isApiKeyPresent = runtimeApiKey.isNotBlank()
+        val hasAizaPrefix = runtimeApiKey.startsWith("AIza")
+        val hasPlaceholder = runtimeApiKey.contains("remix", ignoreCase = true) ||
+                runtimeApiKey.contains("placeholder", ignoreCase = true) ||
+                runtimeApiKey.contains("YOUR_API_KEY", ignoreCase = true)
+
+        val isResKeyPresent = !resApiKey.isNullOrBlank()
+        val doesKeyMatch = isResKeyPresent && runtimeApiKey == resApiKey
+        val keySha = computeSha256Prefix(runtimeApiKey)
+        val resKeySha = computeSha256Prefix(resApiKey)
+
+        val isAppIdMatch = resAppId != null && runtimeAppId == resAppId
+        val isProjIdMatch = runtimeProjId.equals("cinestream-sulo", ignoreCase = true)
+
+        val isDivergent = (resApiKey != null && runtimeApiKey != resApiKey) ||
+                (resAppId != null && runtimeAppId != resAppId) ||
+                (resProjId != null && runtimeProjId != resProjId)
+
+        FirebaseRuntimeDiagnostics(
+            buildApplicationId = buildAppId,
+            runtimePackageName = pkgName,
+            isPackageMatched = isPkgMatch,
+            buildType = bType,
+            versionName = vName,
+            versionCode = vCode,
+            activeFirebaseAppName = defaultAppName,
+            isDefaultAppInitialized = defaultApp != null,
+            totalAppsCount = appsList.size,
+            runtimeProjectId = runtimeProjId,
+            runtimeApplicationId = runtimeAppId,
+            vmAuthAppName = vmAuthAppName,
+            vmAuthProjectId = vmAuthProjId,
+            vmAuthApplicationId = vmAuthAppId,
+            isVmAuthUsingDefaultApp = isVmAuthDefault,
+            isFirebaseInitializerSuccess = isInitSuccess,
+            firebaseInitError = initError,
+            isApiKeyPresent = isApiKeyPresent,
+            hasAizaPrefix = hasAizaPrefix,
+            hasPlaceholderFragment = hasPlaceholder,
+            isGeneratedResKeyPresent = isResKeyPresent,
+            doesKeyMatchGeneratedResource = doesKeyMatch,
+            keySha256Short = keySha,
+            resKeySha256Short = resKeySha,
+            generatedAppId = resAppId ?: "Missing",
+            isAppIdMatchingGenerated = isAppIdMatch,
+            generatedProjectId = resProjId ?: "Missing",
+            isProjectIdMatchingExpected = isProjIdMatch,
+            isConfigurationDivergent = isDivergent
+        )
+    }
+}
+
+@Composable
+fun DebugFirebaseDiagnosticCard(viewModel: LoginViewModel) {
+    var isExpanded by remember { mutableStateOf(false) }
+    var refreshCounter by remember { mutableIntStateOf(0) }
+    val diag = rememberFirebaseRuntimeDiagnostics(viewModel, refreshCounter)
+    val context = LocalContext.current
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = DarkSurface),
+        shape = RoundedCornerShape(14.dp),
+        border = CardDefaults.outlinedCardBorder().copy(
+            brush = Brush.linearGradient(
+                if (diag.isConfigurationDivergent || !diag.isPackageMatched || diag.hasPlaceholderFragment)
+                    listOf(MetricRed, MetricRed)
+                else
+                    listOf(DarkCardBorder, DarkCardBorder)
+            )
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { isExpanded = !isExpanded },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.BugReport,
+                        contentDescription = "Diagnostics",
+                        tint = if (diag.isPackageMatched && diag.hasAizaPrefix && !diag.hasPlaceholderFragment) MetricGreen else MetricRed,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        "Firebase Diagnostic (DEBUG)",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = { refreshCounter++ },
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = TextSecondary, modifier = Modifier.size(16.dp))
+                    }
+                    Icon(
+                        if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = "Toggle",
+                        tint = TextSecondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                DiagnosticBadge(
+                    label = if (diag.isPackageMatched) "PKG OK" else "PKG MISMATCH",
+                    isSuccess = diag.isPackageMatched,
+                    modifier = Modifier.weight(1f)
+                )
+                DiagnosticBadge(
+                    label = if (diag.isDefaultAppInitialized) "APP: OK" else "APP: NONE",
+                    isSuccess = diag.isDefaultAppInitialized,
+                    modifier = Modifier.weight(1f)
+                )
+                DiagnosticBadge(
+                    label = if (diag.hasAizaPrefix && !diag.hasPlaceholderFragment) "KEY: OK" else "KEY: INVALID",
+                    isSuccess = diag.hasAizaPrefix && !diag.hasPlaceholderFragment,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            if (isExpanded) {
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider(color = DarkCardBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+
+                DiagnosticSectionHeader("A. App & Package Identity")
+                DiagnosticItem("Application ID (Build)", diag.buildApplicationId)
+                DiagnosticItem("Package Name (Context)", diag.runtimePackageName)
+                DiagnosticItem("Package Match", if (diag.isPackageMatched) "MATCHED" else "MISMATCH!", isGood = diag.isPackageMatched)
+                DiagnosticItem("Build Type / Variant", "${diag.buildType} (v${diag.versionName} #${diag.versionCode})")
+
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = DarkCardBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+
+                DiagnosticSectionHeader("B. Runtime Firebase Options")
+                DiagnosticItem("Default App Initialized", "${diag.isDefaultAppInitialized} (${diag.activeFirebaseAppName})", isGood = diag.isDefaultAppInitialized)
+                DiagnosticItem("Total Firebase Apps", "${diag.totalAppsCount}")
+                DiagnosticItem("Runtime Project ID", diag.runtimeProjectId, isGood = diag.isProjectIdMatchingExpected)
+                DiagnosticItem("Runtime Application ID", diag.runtimeApplicationId)
+                DiagnosticItem("ViewModel Auth App", diag.vmAuthAppName)
+                DiagnosticItem("VM Uses Default App", if (diag.isVmAuthUsingDefaultApp) "YES (Synced)" else "NO (Different Instance!)", isGood = diag.isVmAuthUsingDefaultApp)
+                DiagnosticItem("FirebaseInitializer", if (diag.isFirebaseInitializerSuccess) "SUCCESS" else "FAILED: ${diag.firebaseInitError}", isGood = diag.isFirebaseInitializerSuccess)
+
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = DarkCardBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+
+                DiagnosticSectionHeader("C. API Key Diagnostics (Zero Leaks)")
+                DiagnosticItem("API Key Non-Empty", if (diag.isApiKeyPresent) "YES" else "NO (Empty)", isGood = diag.isApiKeyPresent)
+                DiagnosticItem("Prefix 'AIza'", if (diag.hasAizaPrefix) "YES" else "NO", isGood = diag.hasAizaPrefix)
+                DiagnosticItem("Placeholder Check", if (diag.hasPlaceholderFragment) "FOUND PLACEHOLDER!" else "NONE (Clean)", isGood = !diag.hasPlaceholderFragment)
+                DiagnosticItem("Generated Res Key Present", if (diag.isGeneratedResKeyPresent) "YES" else "NO", isGood = diag.isGeneratedResKeyPresent)
+                DiagnosticItem("Matches Generated Res", if (diag.doesKeyMatchGeneratedResource) "EXACT MATCH" else "DIVERGENT!", isGood = diag.doesKeyMatchGeneratedResource)
+                DiagnosticItem("Key SHA-256 (Prefix)", "${diag.keySha256Short} vs Res: ${diag.resKeySha256Short}")
+                DiagnosticItem("Generated App ID", diag.generatedAppId)
+                DiagnosticItem("App ID Matches Res", if (diag.isAppIdMatchingGenerated) "MATCHED" else "MISMATCH", isGood = diag.isAppIdMatchingGenerated)
+                DiagnosticItem("Config Divergence", if (diag.isConfigurationDivergent) "WARNING: DIVERGENT" else "NONE (Consistent)", isGood = !diag.isConfigurationDivergent)
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Button(
+                    onClick = {
+                        val summary = formatDiagnosticsSummary(diag)
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        val clip = ClipData.newPlainText("Firebase Diagnostics", summary)
+                        clipboard?.setPrimaryClip(clip)
+                        Toast.makeText(context, "Diagnostics copied to clipboard", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = DarkSurfaceVariant)
+                ) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = "Copy", modifier = Modifier.size(16.dp), tint = Color.White)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Copy Diagnostic Summary", fontSize = 12.sp, color = Color.White)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticBadge(label: String, isSuccess: Boolean, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .background(
+                if (isSuccess) MetricGreen.copy(alpha = 0.15f) else MetricRed.copy(alpha = 0.15f),
+                RoundedCornerShape(6.dp)
+            )
+            .border(
+                1.dp,
+                if (isSuccess) MetricGreen.copy(alpha = 0.5f) else MetricRed.copy(alpha = 0.5f),
+                RoundedCornerShape(6.dp)
+            )
+            .padding(vertical = 4.dp, horizontal = 6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            label,
+            color = if (isSuccess) MetricGreen else MetricRed,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun DiagnosticSectionHeader(title: String) {
+    Text(
+        title,
+        color = CineStreamRed,
+        fontSize = 11.sp,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier.padding(bottom = 4.dp)
+    )
+}
+
+@Composable
+private fun DiagnosticItem(label: String, value: String, isGood: Boolean? = null) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, color = TextSecondary, fontSize = 11.sp)
+        Text(
+            value,
+            color = when (isGood) {
+                true -> MetricGreen
+                false -> MetricRed
+                null -> Color.White
+            },
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
+    }
+}
+
+private fun formatDiagnosticsSummary(d: FirebaseRuntimeDiagnostics): String {
+    return buildString {
+        appendLine("=== CINESTREAM ADMIN FIREBASE DIAGNOSTICS ===")
+        appendLine("App ID (Build): ${d.buildApplicationId}")
+        appendLine("Package (Runtime): ${d.runtimePackageName} (Matched: ${d.isPackageMatched})")
+        appendLine("Build Variant: ${d.buildType} | v${d.versionName} (${d.versionCode})")
+        appendLine("Default FirebaseApp: ${d.isDefaultAppInitialized} [${d.activeFirebaseAppName}]")
+        appendLine("Apps Count: ${d.totalAppsCount}")
+        appendLine("Runtime Project ID: ${d.runtimeProjectId} (Expected Match: ${d.isProjectIdMatchingExpected})")
+        appendLine("Runtime App ID: ${d.runtimeApplicationId}")
+        appendLine("VM Auth App: ${d.vmAuthAppName} (Default: ${d.isVmAuthUsingDefaultApp})")
+        appendLine("FirebaseInitializer: ${d.isFirebaseInitializerSuccess}")
+        if (d.firebaseInitError != null) appendLine("Init Error: ${d.firebaseInitError}")
+        appendLine("Key Present: ${d.isApiKeyPresent}")
+        appendLine("AIza Prefix: ${d.hasAizaPrefix}")
+        appendLine("Placeholder Fragment: ${d.hasPlaceholderFragment}")
+        appendLine("Generated Res Key Present: ${d.isGeneratedResKeyPresent}")
+        appendLine("Matches Res Key: ${d.doesKeyMatchGeneratedResource}")
+        appendLine("Key SHA-256 (8h): Runtime=${d.keySha256Short} vs Res=${d.resKeySha256Short}")
+        appendLine("Generated App ID: ${d.generatedAppId} (Matched: ${d.isAppIdMatchingGenerated})")
+        appendLine("Configuration Divergence: ${d.isConfigurationDivergent}")
+        appendLine("=============================================")
+    }
 }
