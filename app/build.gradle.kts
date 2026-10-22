@@ -14,7 +14,7 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.cinestreamadmin.mhihgp"
+    applicationId = "com.aistudio.cinestreamadmin.adcxz"
     minSdk = 24
     targetSdk = 36
     versionCode = 1
