@@ -15,6 +15,27 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
+data class LastAuthDiagnostic(
+    val authMethod: String = "",
+    val timestamp: Long = 0L,
+    val exceptionClass: String = "",
+    val errorCode: String = "",
+    val rawMessage: String = "",
+    val causeMessage: String? = null,
+    val firebaseAppName: String = "",
+    val firebaseProjectId: String = "",
+    val isDefaultApp: Boolean = true
+)
+
+data class ProbeResult(
+    val httpStatusCode: Int = 0,
+    val statusCategory: String = "",
+    val reasonCode: String = "",
+    val serverMessage: String = "",
+    val details: String = "",
+    val timestamp: Long = System.currentTimeMillis()
+)
+
 data class LoginUiState(
     val email: String = "",
     val password: String = "",
@@ -24,7 +45,10 @@ data class LoginUiState(
     val isLoggedIn: Boolean = false,
     val isResetLoading: Boolean = false,
     val resetMessage: String? = null,
-    val resetError: String? = null
+    val resetError: String? = null,
+    val lastAuthDiagnostic: LastAuthDiagnostic? = null,
+    val probeResult: ProbeResult? = null,
+    val isProbeLoading: Boolean = false
 )
 
 class LoginViewModel(private val repository: AdminRepository = AdminRepository()) : ViewModel() {
@@ -117,16 +141,48 @@ class LoginViewModel(private val repository: AdminRepository = AdminRepository()
                     if (task.isSuccessful) {
                         checkAndCreateUserProfile(task.result?.user ?: auth.currentUser)
                     } else {
+                        val ex = task.exception
+                        val errorCode = (ex as? com.google.firebase.auth.FirebaseAuthException)?.errorCode
+                            ?: (ex as? com.google.firebase.FirebaseException)?.javaClass?.simpleName
+                            ?: "UNKNOWN"
+                        val currentApp = try { auth.app } catch (_: Exception) { null }
+                        val diag = LastAuthDiagnostic(
+                            authMethod = "Email/Password",
+                            timestamp = System.currentTimeMillis(),
+                            exceptionClass = ex?.javaClass?.name ?: "Unknown",
+                            errorCode = errorCode,
+                            rawMessage = ex?.message ?: "Login failed",
+                            causeMessage = ex?.cause?.message,
+                            firebaseAppName = currentApp?.name ?: "Unknown",
+                            firebaseProjectId = currentApp?.options?.projectId ?: "Unknown",
+                            isDefaultApp = currentApp?.name == com.google.firebase.FirebaseApp.DEFAULT_APP_NAME
+                        )
+                        AppLogger.w("LoginViewModel", "Login failure: method=Email, code=$errorCode, exception=${ex?.javaClass?.simpleName}, msg=${ex?.message}")
                         _uiState.value = _uiState.value.copy(
                             isLoading = false,
-                            error = task.exception?.message ?: "Login failed"
+                            error = task.exception?.message ?: "Login failed",
+                            lastAuthDiagnostic = diag
                         )
                     }
                 }
         } catch (e: Exception) {
+            val currentApp = try { auth.app } catch (_: Exception) { null }
+            val diag = LastAuthDiagnostic(
+                authMethod = "Email/Password (Client Exception)",
+                timestamp = System.currentTimeMillis(),
+                exceptionClass = e.javaClass.name,
+                errorCode = "CLIENT_EXCEPTION",
+                rawMessage = e.message ?: "Exception",
+                causeMessage = e.cause?.message,
+                firebaseAppName = currentApp?.name ?: "Unknown",
+                firebaseProjectId = currentApp?.options?.projectId ?: "Unknown",
+                isDefaultApp = currentApp?.name == com.google.firebase.FirebaseApp.DEFAULT_APP_NAME
+            )
+            AppLogger.e("LoginViewModel", "Login synchronous exception", e)
             _uiState.value = _uiState.value.copy(
                 isLoading = false,
-                error = "Login Error: ${e.message}"
+                error = "Login Error: ${e.message}",
+                lastAuthDiagnostic = diag
             )
         }
     }
@@ -150,20 +206,184 @@ class LoginViewModel(private val repository: AdminRepository = AdminRepository()
                     if (task.isSuccessful) {
                         checkAndCreateUserProfile(task.result?.user ?: auth.currentUser)
                     } else {
+                        val ex = task.exception
+                        val errorCode = (ex as? com.google.firebase.auth.FirebaseAuthException)?.errorCode
+                            ?: (ex as? com.google.firebase.FirebaseException)?.javaClass?.simpleName
+                            ?: "UNKNOWN"
+                        val currentApp = try { auth.app } catch (_: Exception) { null }
+                        val diag = LastAuthDiagnostic(
+                            authMethod = "Google Credential",
+                            timestamp = System.currentTimeMillis(),
+                            exceptionClass = ex?.javaClass?.name ?: "Unknown",
+                            errorCode = errorCode,
+                            rawMessage = ex?.localizedMessage ?: "Google Sign-in failed",
+                            causeMessage = ex?.cause?.message,
+                            firebaseAppName = currentApp?.name ?: "Unknown",
+                            firebaseProjectId = currentApp?.options?.projectId ?: "Unknown",
+                            isDefaultApp = currentApp?.name == com.google.firebase.FirebaseApp.DEFAULT_APP_NAME
+                        )
+                        AppLogger.w("LoginViewModel", "Google Sign-In failure: code=$errorCode, exception=${ex?.javaClass?.simpleName}, msg=${ex?.message}")
                         _uiState.value = _uiState.value.copy(
                             isLoading = false,
                             isGoogleLoading = false,
-                            error = task.exception?.localizedMessage ?: "Google Sign-in failed. Check network, OAuth client configuration, and Firebase Authentication settings."
+                            error = task.exception?.localizedMessage ?: "Google Sign-in failed. Check network, OAuth client configuration, and Firebase Authentication settings.",
+                            lastAuthDiagnostic = diag
                         )
                     }
                 }
         } catch (e: Exception) {
             AppLogger.e("LoginViewModel", "Google Firebase credential exchange failed", e)
+            val currentApp = try { auth.app } catch (_: Exception) { null }
+            val diag = LastAuthDiagnostic(
+                authMethod = "Google Credential (Client Exception)",
+                timestamp = System.currentTimeMillis(),
+                exceptionClass = e.javaClass.name,
+                errorCode = "CLIENT_EXCEPTION",
+                rawMessage = e.localizedMessage ?: "Exception",
+                causeMessage = e.cause?.message,
+                firebaseAppName = currentApp?.name ?: "Unknown",
+                firebaseProjectId = currentApp?.options?.projectId ?: "Unknown",
+                isDefaultApp = currentApp?.name == com.google.firebase.FirebaseApp.DEFAULT_APP_NAME
+            )
             _uiState.value = _uiState.value.copy(
                 isLoading = false,
                 isGoogleLoading = false,
-                error = e.localizedMessage ?: "Google Sign-in could not be completed. Please try again."
+                error = e.localizedMessage ?: "Google Sign-in could not be completed. Please try again.",
+                lastAuthDiagnostic = diag
             )
+        }
+    }
+
+    fun runIdentityToolkitProbe(runtimeCertSha1: String) {
+        _uiState.value = _uiState.value.copy(isProbeLoading = true)
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val apiKey = auth.app.options.apiKey.trim()
+                val packageName = auth.app.applicationContext.packageName
+                val certHex = runtimeCertSha1.replace(":", "").lowercase()
+
+                val url = java.net.URL("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=$apiKey")
+                val conn = (url.openConnection() as java.net.HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                    if (packageName.isNotBlank()) setRequestProperty("X-Android-Package", packageName)
+                    if (certHex.isNotBlank() && !certHex.contains("error", ignoreCase = true)) {
+                        setRequestProperty("X-Android-Cert", certHex)
+                    }
+                    connectTimeout = 8000
+                    readTimeout = 8000
+                    doOutput = true
+                }
+
+                val requestJson = """{"email":"connectivity-probe@cinestream.invalid","password":"probepassword","returnSecureToken":true}"""
+                conn.outputStream.use { os ->
+                    os.write(requestJson.toByteArray(Charsets.UTF_8))
+                }
+
+                val statusCode = conn.responseCode
+                val responseText = try {
+                    val stream = if (statusCode in 200..299) conn.inputStream else conn.errorStream
+                    stream?.bufferedReader()?.use { it.readText() } ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+
+                val hasApiKeyInvalid = responseText.contains("API_KEY_INVALID", ignoreCase = true) ||
+                        responseText.contains("API key not valid", ignoreCase = true)
+                val hasServiceBlocked = responseText.contains("API_KEY_SERVICE_BLOCKED", ignoreCase = true) ||
+                        responseText.contains("not authorized to use this service", ignoreCase = true)
+                val hasAndroidAppBlocked = responseText.contains("API_KEY_ANDROID_APP_BLOCKED", ignoreCase = true) ||
+                        responseText.contains("Android client application", ignoreCase = true)
+                val hasInvalidCredentials = responseText.contains("INVALID_LOGIN_CREDENTIALS", ignoreCase = true) ||
+                        responseText.contains("EMAIL_NOT_FOUND", ignoreCase = true)
+
+                val probeResult = when {
+                    hasInvalidCredentials -> {
+                        ProbeResult(
+                            httpStatusCode = statusCode,
+                            statusCategory = "REST_KEY_VALID",
+                            reasonCode = "INVALID_LOGIN_CREDENTIALS",
+                            serverMessage = "API key accepted by Identity Toolkit",
+                            details = "Identity Toolkit accepted the API key at HTTP REST level! The key exists, is enabled, and is valid."
+                        )
+                    }
+                    hasApiKeyInvalid -> {
+                        ProbeResult(
+                            httpStatusCode = statusCode,
+                            statusCategory = "API_KEY_INVALID",
+                            reasonCode = "API_KEY_INVALID",
+                            serverMessage = "API key not valid",
+                            details = "Google Cloud rejected the API key string itself as invalid. Check that the key exists in Google Cloud Console."
+                        )
+                    }
+                    hasServiceBlocked -> {
+                        ProbeResult(
+                            httpStatusCode = statusCode,
+                            statusCategory = "API_KEY_SERVICE_BLOCKED",
+                            reasonCode = "API_KEY_SERVICE_BLOCKED",
+                            serverMessage = "Identity Toolkit API blocked",
+                            details = "Google Cloud API restrictions on this key do not allow Identity Toolkit API. Add Identity Toolkit API to the allowed APIs in Google Cloud Console."
+                        )
+                    }
+                    hasAndroidAppBlocked -> {
+                        ProbeResult(
+                            httpStatusCode = statusCode,
+                            statusCategory = "API_KEY_ANDROID_APP_BLOCKED",
+                            reasonCode = "API_KEY_ANDROID_APP_BLOCKED",
+                            serverMessage = "Android package or SHA-1 rejected",
+                            details = "Google Cloud Application Restrictions rejected package name or SHA-1 certificate fingerprint. Add package and SHA-1 in Google Cloud Console."
+                        )
+                    }
+                    statusCode == 403 -> {
+                        ProbeResult(
+                            httpStatusCode = statusCode,
+                            statusCategory = "FORBIDDEN_403",
+                            reasonCode = "PERMISSION_DENIED",
+                            serverMessage = responseText.take(150),
+                            details = "Google Cloud returned 403 Forbidden. Check restrictions in Google Cloud Console."
+                        )
+                    }
+                    statusCode in 200..299 -> {
+                        ProbeResult(
+                            httpStatusCode = statusCode,
+                            statusCategory = "REST_KEY_VALID",
+                            reasonCode = "SUCCESS",
+                            serverMessage = "Success",
+                            details = "Identity Toolkit returned HTTP $statusCode. Key is working."
+                        )
+                    }
+                    else -> {
+                        ProbeResult(
+                            httpStatusCode = statusCode,
+                            statusCategory = "HTTP_$statusCode",
+                            reasonCode = "OTHER",
+                            serverMessage = responseText.take(150),
+                            details = "Identity Toolkit returned HTTP $statusCode: ${responseText.take(200)}"
+                        )
+                    }
+                }
+
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(
+                        isProbeLoading = false,
+                        probeResult = probeResult
+                    )
+                }
+            } catch (e: Exception) {
+                val errResult = ProbeResult(
+                    httpStatusCode = 0,
+                    statusCategory = "NETWORK_ERROR",
+                    reasonCode = "EXCEPTION",
+                    serverMessage = e.localizedMessage ?: "Connection failure",
+                    details = "Could not reach identitytoolkit.googleapis.com. Check internet connection: ${e.message}"
+                )
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(
+                        isProbeLoading = false,
+                        probeResult = errResult
+                    )
+                }
+            }
         }
     }
 

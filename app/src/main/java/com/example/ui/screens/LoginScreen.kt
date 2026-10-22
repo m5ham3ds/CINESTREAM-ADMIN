@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import java.security.MessageDigest
 import java.security.SecureRandom
+import android.content.pm.PackageManager
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -491,6 +492,28 @@ fun CustomTextField(
     )
 }
 
+private fun getAppSigningCertificateSha1(context: Context): String {
+    return try {
+        val pm = context.packageManager
+        val packageName = context.packageName
+        val signatures = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            val packageInfo = pm.getPackageInfo(packageName, android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES)
+            packageInfo.signingInfo?.apkContentsSigners
+        } else {
+            @Suppress("DEPRECATION")
+            val packageInfo = pm.getPackageInfo(packageName, android.content.pm.PackageManager.GET_SIGNATURES)
+            @Suppress("DEPRECATION")
+            packageInfo.signatures
+        }
+        val cert = signatures?.firstOrNull()?.toByteArray() ?: return "NO_CERT"
+        val md = MessageDigest.getInstance("SHA-1")
+        val digest = md.digest(cert)
+        digest.joinToString(":") { "%02X".format(it) }
+    } catch (e: Exception) {
+        "ERROR: ${e.message}"
+    }
+}
+
 data class FirebaseRuntimeDiagnostics(
     val buildApplicationId: String,
     val runtimePackageName: String,
@@ -498,6 +521,9 @@ data class FirebaseRuntimeDiagnostics(
     val buildType: String,
     val versionName: String,
     val versionCode: Int,
+    val runtimeSigningCertSha1: String,
+    val expectedSigningCertSha1: String,
+    val isSigningCertMatched: Boolean,
     val activeFirebaseAppName: String,
     val isDefaultAppInitialized: Boolean,
     val totalAppsCount: Int,
@@ -520,7 +546,10 @@ data class FirebaseRuntimeDiagnostics(
     val isAppIdMatchingGenerated: Boolean,
     val generatedProjectId: String,
     val isProjectIdMatchingExpected: Boolean,
-    val isConfigurationDivergent: Boolean
+    val isConfigurationDivergent: Boolean,
+    val lastAuthDiagnostic: com.example.viewmodels.LastAuthDiagnostic?,
+    val probeResult: com.example.viewmodels.ProbeResult?,
+    val isProbeLoading: Boolean
 )
 
 @Composable
@@ -529,13 +558,18 @@ fun rememberFirebaseRuntimeDiagnostics(
     refreshTrigger: Int
 ): FirebaseRuntimeDiagnostics {
     val context = LocalContext.current
-    return remember(refreshTrigger) {
+    val uiState by viewModel.uiState.collectAsState()
+    return remember(refreshTrigger, uiState.lastAuthDiagnostic, uiState.probeResult, uiState.isProbeLoading) {
         val buildAppId = BuildConfig.APPLICATION_ID
         val pkgName = context.packageName
         val isPkgMatch = buildAppId == pkgName
         val bType = BuildConfig.BUILD_TYPE
         val vName = BuildConfig.VERSION_NAME
         val vCode = BuildConfig.VERSION_CODE
+
+        val expectedCert = "54:A8:14:FB:04:DE:BD:98:3F:33:6E:F8:2E:87:82:0E:DB:76:0F:12"
+        val runtimeCert = getAppSigningCertificateSha1(context)
+        val isCertMatch = runtimeCert.equals(expectedCert, ignoreCase = true)
 
         val defaultApp = try { FirebaseApp.getInstance() } catch (_: Exception) { null }
         val appsList = try { FirebaseApp.getApps(context) } catch (_: Exception) { emptyList<FirebaseApp>() }
@@ -601,6 +635,9 @@ fun rememberFirebaseRuntimeDiagnostics(
             buildType = bType,
             versionName = vName,
             versionCode = vCode,
+            runtimeSigningCertSha1 = runtimeCert,
+            expectedSigningCertSha1 = expectedCert,
+            isSigningCertMatched = isCertMatch,
             activeFirebaseAppName = defaultAppName,
             isDefaultAppInitialized = defaultApp != null,
             totalAppsCount = appsList.size,
@@ -623,7 +660,10 @@ fun rememberFirebaseRuntimeDiagnostics(
             isAppIdMatchingGenerated = isAppIdMatch,
             generatedProjectId = resProjId ?: "Missing",
             isProjectIdMatchingExpected = isProjIdMatch,
-            isConfigurationDivergent = isDivergent
+            isConfigurationDivergent = isDivergent,
+            lastAuthDiagnostic = uiState.lastAuthDiagnostic,
+            probeResult = uiState.probeResult,
+            isProbeLoading = uiState.isProbeLoading
         )
     }
 }
@@ -640,7 +680,7 @@ fun DebugFirebaseDiagnosticCard(viewModel: LoginViewModel) {
         shape = RoundedCornerShape(14.dp),
         border = CardDefaults.outlinedCardBorder().copy(
             brush = Brush.linearGradient(
-                if (diag.isConfigurationDivergent || !diag.isPackageMatched || diag.hasPlaceholderFragment)
+                if (diag.isConfigurationDivergent || !diag.isPackageMatched || !diag.isSigningCertMatched || diag.hasPlaceholderFragment)
                     listOf(MetricRed, MetricRed)
                 else
                     listOf(DarkCardBorder, DarkCardBorder)
@@ -660,7 +700,7 @@ fun DebugFirebaseDiagnosticCard(viewModel: LoginViewModel) {
                     Icon(
                         Icons.Default.BugReport,
                         contentDescription = "Diagnostics",
-                        tint = if (diag.isPackageMatched && diag.hasAizaPrefix && !diag.hasPlaceholderFragment) MetricGreen else MetricRed,
+                        tint = if (diag.isPackageMatched && diag.isSigningCertMatched && diag.hasAizaPrefix && !diag.hasPlaceholderFragment) MetricGreen else MetricRed,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
@@ -692,11 +732,16 @@ fun DebugFirebaseDiagnosticCard(viewModel: LoginViewModel) {
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 DiagnosticBadge(
                     label = if (diag.isPackageMatched) "PKG OK" else "PKG MISMATCH",
                     isSuccess = diag.isPackageMatched,
+                    modifier = Modifier.weight(1f)
+                )
+                DiagnosticBadge(
+                    label = if (diag.isSigningCertMatched) "SIGN OK" else "SIGN MISMATCH",
+                    isSuccess = diag.isSigningCertMatched,
                     modifier = Modifier.weight(1f)
                 )
                 DiagnosticBadge(
@@ -726,7 +771,16 @@ fun DebugFirebaseDiagnosticCard(viewModel: LoginViewModel) {
                 HorizontalDivider(color = DarkCardBorder)
                 Spacer(modifier = Modifier.height(10.dp))
 
-                DiagnosticSectionHeader("B. Runtime Firebase Options")
+                DiagnosticSectionHeader("B. Signing Keystore & Fingerprint (Canonical Lock)")
+                DiagnosticItem("Runtime APK SHA-1", diag.runtimeSigningCertSha1, isGood = diag.isSigningCertMatched)
+                DiagnosticItem("Expected Locked SHA-1", diag.expectedSigningCertSha1)
+                DiagnosticItem("Keystore Match", if (diag.isSigningCertMatched) "MATCHED (Canonical Debug)" else "MISMATCH! (Re-signed or local key)", isGood = diag.isSigningCertMatched)
+
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = DarkCardBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+
+                DiagnosticSectionHeader("C. Runtime Firebase Options & Instance Sync")
                 DiagnosticItem("Default App Initialized", "${diag.isDefaultAppInitialized} (${diag.activeFirebaseAppName})", isGood = diag.isDefaultAppInitialized)
                 DiagnosticItem("Total Firebase Apps", "${diag.totalAppsCount}")
                 DiagnosticItem("Runtime Project ID", diag.runtimeProjectId, isGood = diag.isProjectIdMatchingExpected)
@@ -739,7 +793,7 @@ fun DebugFirebaseDiagnosticCard(viewModel: LoginViewModel) {
                 HorizontalDivider(color = DarkCardBorder)
                 Spacer(modifier = Modifier.height(10.dp))
 
-                DiagnosticSectionHeader("C. API Key Diagnostics (Zero Leaks)")
+                DiagnosticSectionHeader("D. API Key Integrity (Zero Leaks)")
                 DiagnosticItem("API Key Non-Empty", if (diag.isApiKeyPresent) "YES" else "NO (Empty)", isGood = diag.isApiKeyPresent)
                 DiagnosticItem("Prefix 'AIza'", if (diag.hasAizaPrefix) "YES" else "NO", isGood = diag.hasAizaPrefix)
                 DiagnosticItem("Placeholder Check", if (diag.hasPlaceholderFragment) "FOUND PLACEHOLDER!" else "NONE (Clean)", isGood = !diag.hasPlaceholderFragment)
@@ -749,6 +803,95 @@ fun DebugFirebaseDiagnosticCard(viewModel: LoginViewModel) {
                 DiagnosticItem("Generated App ID", diag.generatedAppId)
                 DiagnosticItem("App ID Matches Res", if (diag.isAppIdMatchingGenerated) "MATCHED" else "MISMATCH", isGood = diag.isAppIdMatchingGenerated)
                 DiagnosticItem("Config Divergence", if (diag.isConfigurationDivergent) "WARNING: DIVERGENT" else "NONE (Consistent)", isGood = !diag.isConfigurationDivergent)
+
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = DarkCardBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+
+                DiagnosticSectionHeader("E. Last Auth Attempt Evidence")
+                if (diag.lastAuthDiagnostic != null) {
+                    val last = diag.lastAuthDiagnostic
+                    DiagnosticItem("Auth Method", last.authMethod)
+                    DiagnosticItem("Exception Class", last.exceptionClass, isGood = false)
+                    DiagnosticItem("Error Code", last.errorCode, isGood = false)
+                    DiagnosticItem("Raw SDK Message", last.rawMessage)
+                    if (!last.causeMessage.isNullOrBlank()) {
+                        DiagnosticItem("Cause Message", last.causeMessage)
+                    }
+                    DiagnosticItem("FirebaseApp Used", "${last.firebaseAppName} (${if (last.isDefaultApp) "Default" else "Secondary!"})", isGood = last.isDefaultApp)
+                    DiagnosticItem("Project ID Used", last.firebaseProjectId)
+                } else {
+                    DiagnosticItem("Last Attempt", "No failed auth attempt recorded in current session", isGood = true)
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = DarkCardBorder)
+                Spacer(modifier = Modifier.height(10.dp))
+
+                DiagnosticSectionHeader("F. Live Google Identity Toolkit Probe")
+                Text(
+                    "Probes identitytoolkit.googleapis.com with active API key and device package/SHA-1 headers to distinguish key validity vs API restrictions vs app restrictions.",
+                    color = TextSecondary,
+                    fontSize = 11.sp
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+
+                if (diag.probeResult != null) {
+                    val p = diag.probeResult
+                    val isProbeGood = p.statusCategory.startsWith("REST_KEY_VALID")
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                if (isProbeGood) MetricGreen.copy(alpha = 0.12f) else MetricRed.copy(alpha = 0.12f),
+                                RoundedCornerShape(8.dp)
+                            )
+                            .border(
+                                1.dp,
+                                if (isProbeGood) MetricGreen.copy(alpha = 0.4f) else MetricRed.copy(alpha = 0.4f),
+                                RoundedCornerShape(8.dp)
+                            )
+                            .padding(8.dp)
+                    ) {
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    if (isProbeGood) Icons.Default.CheckCircle else Icons.Default.Error,
+                                    contentDescription = null,
+                                    tint = if (isProbeGood) MetricGreen else MetricRed,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Status: ${p.statusCategory} [HTTP ${p.httpStatusCode}]",
+                                    color = if (isProbeGood) MetricGreen else MetricRed,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(p.details, color = Color.White, fontSize = 11.sp)
+                            if (p.serverMessage.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text("Response: ${p.serverMessage}", color = TextSecondary, fontSize = 10.sp)
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+
+                CineStreamLoadingButton(
+                    onClick = {
+                        viewModel.runIdentityToolkitProbe(diag.runtimeSigningCertSha1)
+                    },
+                    isLoading = diag.isProbeLoading,
+                    enabled = !diag.isProbeLoading && diag.isApiKeyPresent,
+                    modifier = Modifier.fillMaxWidth().height(38.dp),
+                    containerColor = DarkSurfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                    text = "Run Identity Toolkit Probe",
+                    loadingText = "Probing Identity Toolkit..."
+                )
 
                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -786,13 +929,13 @@ private fun DiagnosticBadge(label: String, isSuccess: Boolean, modifier: Modifie
                 if (isSuccess) MetricGreen.copy(alpha = 0.5f) else MetricRed.copy(alpha = 0.5f),
                 RoundedCornerShape(6.dp)
             )
-            .padding(vertical = 4.dp, horizontal = 6.dp),
+            .padding(vertical = 4.dp, horizontal = 4.dp),
         contentAlignment = Alignment.Center
     ) {
         Text(
             label,
             color = if (isSuccess) MetricGreen else MetricRed,
-            fontSize = 10.sp,
+            fontSize = 9.sp,
             fontWeight = FontWeight.Bold,
             maxLines = 1
         )
@@ -819,7 +962,8 @@ private fun DiagnosticItem(label: String, value: String, isGood: Boolean? = null
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, color = TextSecondary, fontSize = 11.sp)
+        Text(label, color = TextSecondary, fontSize = 11.sp, modifier = Modifier.weight(1f, fill = false))
+        Spacer(modifier = Modifier.width(8.dp))
         Text(
             value,
             color = when (isGood) {
@@ -829,7 +973,9 @@ private fun DiagnosticItem(label: String, value: String, isGood: Boolean? = null
             },
             fontSize = 11.sp,
             fontWeight = FontWeight.Medium,
-            maxLines = 1
+            textAlign = TextAlign.End,
+            maxLines = 2,
+            modifier = Modifier.weight(1.5f, fill = false)
         )
     }
 }
@@ -840,6 +986,8 @@ private fun formatDiagnosticsSummary(d: FirebaseRuntimeDiagnostics): String {
         appendLine("App ID (Build): ${d.buildApplicationId}")
         appendLine("Package (Runtime): ${d.runtimePackageName} (Matched: ${d.isPackageMatched})")
         appendLine("Build Variant: ${d.buildType} | v${d.versionName} (${d.versionCode})")
+        appendLine("Runtime Signing SHA-1: ${d.runtimeSigningCertSha1}")
+        appendLine("Expected Signing SHA-1: ${d.expectedSigningCertSha1} (Matched: ${d.isSigningCertMatched})")
         appendLine("Default FirebaseApp: ${d.isDefaultAppInitialized} [${d.activeFirebaseAppName}]")
         appendLine("Apps Count: ${d.totalAppsCount}")
         appendLine("Runtime Project ID: ${d.runtimeProjectId} (Expected Match: ${d.isProjectIdMatchingExpected})")
@@ -855,6 +1003,26 @@ private fun formatDiagnosticsSummary(d: FirebaseRuntimeDiagnostics): String {
         appendLine("Key SHA-256 (8h): Runtime=${d.keySha256Short} vs Res=${d.resKeySha256Short}")
         appendLine("Generated App ID: ${d.generatedAppId} (Matched: ${d.isAppIdMatchingGenerated})")
         appendLine("Configuration Divergence: ${d.isConfigurationDivergent}")
+        if (d.lastAuthDiagnostic != null) {
+            val l = d.lastAuthDiagnostic
+            appendLine("--- LAST AUTH ATTEMPT ---")
+            appendLine("Method: ${l.authMethod}")
+            appendLine("Exception Class: ${l.exceptionClass}")
+            appendLine("Error Code: ${l.errorCode}")
+            appendLine("Raw Message: ${l.rawMessage}")
+            if (!l.causeMessage.isNullOrBlank()) appendLine("Cause: ${l.causeMessage}")
+            appendLine("FirebaseApp: ${l.firebaseAppName} (isDefault: ${l.isDefaultApp})")
+            appendLine("Project ID: ${l.firebaseProjectId}")
+        }
+        if (d.probeResult != null) {
+            val p = d.probeResult
+            appendLine("--- IDENTITY TOOLKIT PROBE ---")
+            appendLine("HTTP Status: ${p.httpStatusCode}")
+            appendLine("Category: ${p.statusCategory}")
+            appendLine("Reason: ${p.reasonCode}")
+            appendLine("Server Message: ${p.serverMessage}")
+            appendLine("Details: ${p.details}")
+        }
         appendLine("=============================================")
     }
 }
