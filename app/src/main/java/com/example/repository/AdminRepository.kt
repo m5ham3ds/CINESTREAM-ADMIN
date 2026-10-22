@@ -1,0 +1,1603 @@
+package com.example.repository
+
+import com.example.contract.FirebaseCollections
+import com.example.contract.FirebaseConfigDocs
+import com.example.contract.FirebaseSubcollections
+import com.example.diagnostics.AppLogger
+import com.example.models.*
+import com.example.state.AppSettings
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseUser
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.SetOptions
+import com.google.firebase.firestore.Source
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
+
+class AdminRepository {
+    private val _pendingSyncKeys = MutableStateFlow<Set<String>>(emptySet())
+    val pendingSyncKeys: StateFlow<Set<String>> = _pendingSyncKeys.asStateFlow()
+    private fun ensureFirebase() {
+        try {
+            val apps = com.google.firebase.FirebaseApp.getApps(com.example.MyApplication.instance)
+            if (apps.isEmpty()) {
+                com.example.diagnostics.FirebaseInitializer.init(com.example.MyApplication.instance)
+            }
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "ensureFirebase check exception: ${e.message}")
+        }
+    }
+
+    private val auth: FirebaseAuth by lazy {
+        ensureFirebase()
+        FirebaseAuth.getInstance()
+    }
+
+    private val firestore: FirebaseFirestore by lazy {
+        ensureFirebase()
+        FirebaseFirestore.getInstance()
+    }
+
+    private val usersCollection get() = firestore.collection(FirebaseCollections.USERS)
+    private val adminsCollection get() = firestore.collection(FirebaseCollections.ADMINS)
+    private val configCollection get() = firestore.collection(FirebaseCollections.CONFIG)
+    private val notificationsCollection get() = firestore.collection(FirebaseCollections.NOTIFICATIONS)
+    private val auditLogsCollection get() = firestore.collection(FirebaseCollections.AUDIT_LOGS)
+    private val extensionsCollection get() = firestore.collection(FirebaseCollections.LEGACY_EXTENSIONS)
+    private val reportsCollection get() = firestore.collection(FirebaseCollections.REPORTS)
+    private val appUpdatesCollection get() = firestore.collection(FirebaseCollections.APP_UPDATES)
+
+    private fun extractTimestampMillis(doc: com.google.firebase.firestore.DocumentSnapshot, field: String, fallback: Long = 0L): Long {
+        val value = doc.get(field) ?: return fallback
+        return when (value) {
+            is Number -> value.toLong()
+            is com.google.firebase.Timestamp -> value.toDate().time
+            is java.util.Date -> value.time
+            else -> fallback
+        }
+    }
+
+    private fun docToUser(doc: com.google.firebase.firestore.DocumentSnapshot): User? {
+        return try {
+            val uid = doc.getString("uid")?.ifBlank { doc.id } ?: doc.id
+            val isPrem = doc.getBoolean("isPremium") ?: doc.getBoolean("isPro") ?: false
+            val rawSubTier = doc.getString("subscriptionTier")
+            val rawPlan = doc.getString("plan") ?: doc.getString("proPlan")
+            val canonicalTier = when {
+                !rawSubTier.isNullOrBlank() -> CanonicalSubscriptionTier.fromString(rawSubTier)
+                !rawPlan.isNullOrBlank() -> CanonicalSubscriptionTier.fromString(rawPlan)
+                isPrem -> CanonicalSubscriptionTier.PRO
+                else -> CanonicalSubscriptionTier.FREE
+            }
+            val durationDays = doc.getLong("durationDays")?.toInt()
+            val planId = doc.getString("planId") ?: CanonicalPlanId.from(canonicalTier, durationDays)
+            val subStatus = doc.getString("subscriptionStatus") ?: if (canonicalTier != CanonicalSubscriptionTier.FREE) "ACTIVE" else "FREE"
+            val subSource = doc.getString("subscriptionSource") ?: "LEGACY"
+            val subRefId = doc.getString("subscriptionReferenceId")
+            val subStartedAt = extractTimestampMillis(doc, "subscriptionStartedAt", 0L).takeIf { it > 0L }
+            val subExpires = if (doc.contains("subscriptionExpiresAt")) {
+                extractTimestampMillis(doc, "subscriptionExpiresAt", 0L).takeIf { it > 0L }
+            } else if (doc.contains("proExpiresAt")) {
+                extractTimestampMillis(doc, "proExpiresAt", 0L).takeIf { it > 0L }
+            } else null
+
+            val ptsBalance = doc.getLong("pointsBalance") ?: 0L
+            val ptsEarned = if (doc.contains("totalPointsEarned")) doc.getLong("totalPointsEarned") else null
+            val ptsSpent = if (doc.contains("totalPointsSpent")) doc.getLong("totalPointsSpent") else null
+            val ptsEarnedTotal = if (doc.contains("pointsEarnedTotal")) doc.getLong("pointsEarnedTotal") else null
+            val ptsSpentTotal = if (doc.contains("pointsSpentTotal")) doc.getLong("pointsSpentTotal") else null
+
+            val hasPending = doc.metadata.hasPendingWrites()
+            val isBanned = doc.getBoolean("isBanned") ?: false
+            val banReason = doc.getString("banReason")
+            val banExpiresAt = if (doc.contains("banExpiresAt")) {
+                extractTimestampMillis(doc, "banExpiresAt", 0L).takeIf { it > 0L }
+            } else null
+
+            // Dual permission resolution: positive flags take priority, inverted ban flags used as fallback
+            val canWatch = doc.getBoolean("canWatch") ?: !(doc.getBoolean("watchBan") ?: false)
+            val canDownload = doc.getBoolean("canDownload") ?: !(doc.getBoolean("downloadBan") ?: false)
+            val canChat = doc.getBoolean("canChat") ?: !(doc.getBoolean("chatBan") ?: false)
+            val canStory = doc.getBoolean("canStory") ?: !(doc.getBoolean("storyBan") ?: false)
+            val canP2P = doc.getBoolean("canP2P") ?: !(doc.getBoolean("p2pBan") ?: false)
+            val canComment = doc.getBoolean("canComment") ?: true
+            val canUpload = doc.getBoolean("canUpload") ?: false
+            val canRequest = doc.getBoolean("canRequest") ?: true
+
+            val watchBan = doc.getBoolean("watchBan") ?: !canWatch
+            val downloadBan = doc.getBoolean("downloadBan") ?: !canDownload
+            val chatBan = doc.getBoolean("chatBan") ?: !canChat
+            val storyBan = doc.getBoolean("storyBan") ?: !canStory
+            val p2pBan = doc.getBoolean("p2pBan") ?: !canP2P
+
+            val lastLogin = extractTimestampMillis(
+                doc,
+                "lastLoginAt",
+                extractTimestampMillis(doc, "lastLoginTimestamp", 0L)
+            )
+            val updated = extractTimestampMillis(
+                doc,
+                "updatedAt",
+                extractTimestampMillis(doc, "lastActiveAt", 0L)
+            )
+            val created = extractTimestampMillis(doc, "createdAt", 0L)
+
+            User(
+                uid = uid,
+                id = uid,
+                username = doc.getString("username") ?: "",
+                email = doc.getString("email") ?: "",
+                displayName = doc.getString("displayName") ?: "",
+                photoUrl = doc.getString("photoUrl") ?: "",
+                createdAt = created,
+                updatedAt = updated,
+                lastLoginAt = lastLogin,
+                lastLoginTimestamp = lastLogin,
+                lastActiveAt = updated,
+                isActive = doc.getBoolean("isActive") ?: !isBanned,
+                subscriptionTier = canonicalTier.name,
+                planId = planId,
+                durationDays = durationDays,
+                subscriptionStatus = subStatus,
+                subscriptionSource = subSource,
+                subscriptionReferenceId = subRefId,
+                subscriptionStartedAt = subStartedAt,
+                subscriptionExpiresAt = subExpires,
+                isPremium = isPrem,
+                isPro = isPrem,
+                plan = canonicalTier.name.lowercase(),
+                proPlan = canonicalTier.name.lowercase(),
+                proExpiresAt = subExpires,
+                pointsBalance = ptsBalance,
+                totalPointsEarned = ptsEarned,
+                totalPointsSpent = ptsSpent,
+                pointsEarnedTotal = ptsEarnedTotal,
+                pointsSpentTotal = ptsSpentTotal,
+                role = doc.getString("role") ?: "user",
+                isBanned = isBanned,
+                banReason = banReason,
+                banExpiresAt = banExpiresAt,
+                canWatch = canWatch,
+                canDownload = canDownload,
+                canChat = canChat,
+                canStory = canStory,
+                canP2P = canP2P,
+                canComment = canComment,
+                canUpload = canUpload,
+                canRequest = canRequest,
+                watchBan = watchBan,
+                downloadBan = downloadBan,
+                chatBan = chatBan,
+                storyBan = storyBan,
+                p2pBan = p2pBan,
+                deviceLimit = (doc.getLong("deviceLimit") ?: doc.getLong("maxDevices") ?: 2L).toInt(),
+                maxDevices = (doc.getLong("maxDevices") ?: doc.getLong("deviceLimit") ?: 2L).toInt(),
+                allowedQuality = doc.getString("allowedQuality"),
+                downloadLimit = doc.getLong("downloadLimit")?.toInt(),
+                offlineDaysOverride = doc.getLong("offlineDaysOverride")?.toInt(),
+                forcedAdsOverride = doc.getLong("forcedAdsOverride")?.toInt(),
+                appVersion = doc.getString("appVersion") ?: "",
+                admin = doc.getBoolean("admin") ?: false,
+                isAdmin = doc.getBoolean("isAdmin") ?: false,
+                hasPendingSync = hasPending
+            )
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "Failed to deserialize user document ${doc.id}: ${e.message}")
+            null
+        }
+    }
+
+    companion object {
+        const val OWNER_EMAIL = "sulopros01@gmail.com"
+
+        /**
+         * Pure canonical authority evaluation matching firestore.rules isAdmin() logic.
+         * Used for deterministic unit testing and verification across the 7 matrix cases.
+         */
+        fun evaluateAdminAuthority(
+            email: String?,
+            adminDocExists: Boolean,
+            adminDocEnabled: Boolean?,
+            userRole: String? = null,
+            userIsAdmin: Boolean? = null
+        ): Boolean {
+            // Rule 1: Project Owner Email (Bootstrap Authority)
+            val isOwner = email?.equals(OWNER_EMAIL, ignoreCase = true) == true
+            if (isOwner) return true
+
+            // Rule 2: /admins/{uid}.enabled == true (Firestore Authority)
+            // Note: userRole and userIsAdmin parameters are deliberately ignored to enforce canonical rules
+            return adminDocExists && (adminDocEnabled == true)
+        }
+    }
+
+    /**
+     * Verifies if the authenticated user is an authorized administrator.
+     * Enforces the Canonical Firebase Contract:
+     * - The sole authoritative sources are:
+     *   1) Project Owner Bootstrap Email ("sulopros01@gmail.com")
+     *   2) Canonical Firestore document `/admins/{uid}` where `enabled == true`.
+     * - Fallback to `/users/{uid}.role` or `users.isAdmin` is STRICTLY REMOVED to align 100% with firestore.rules.
+     * - Provisions bootstrap superadmin credentials for the project owner.
+     */
+    suspend fun checkIsAdmin(user: FirebaseUser): Boolean {
+        // Match the Firestore Rules bootstrap: the owner email must be verified in the Firebase ID token.
+        // A matching but unverified email is not sufficient for an administrative session.
+        val matchesOwnerEmail = user.email?.equals(OWNER_EMAIL, ignoreCase = true) == true
+        val isOwner = matchesOwnerEmail && user.isEmailVerified
+        if (matchesOwnerEmail && !user.isEmailVerified) {
+            AppSettings.clearAdminSession()
+            AppLogger.w("AdminRepository", "Owner email matched but is not verified; denying admin authority to match Firestore Rules.")
+            return false
+        }
+        if (isOwner) {
+            AppLogger.i("AdminRepository", "Project owner authenticated: ${user.email}")
+            AppSettings.setAdminSession(user.uid, user.email ?: "")
+            try {
+                // Non-blocking fire-and-forget sync to /admins so offline mode never hangs!
+                adminsCollection.document(user.uid).set(
+                    AdminUser(
+                        uid = user.uid,
+                        email = user.email ?: "",
+                        role = "superadmin",
+                        enabled = true,
+                        createdAt = System.currentTimeMillis()
+                    ),
+                    SetOptions.merge()
+                )
+            } catch (e: Exception) {
+                AppLogger.w("AdminRepository", "Owner bootstrap doc write non-fatal notice: ${e.message}")
+            }
+            return true
+        }
+
+        // Check canonical /admins/{uid} in Firestore with short timeout falling back to local cache
+        try {
+            val adminDoc = try {
+                withTimeoutOrNull(2500L) {
+                    adminsCollection.document(user.uid).get(Source.SERVER).await()
+                } ?: adminsCollection.document(user.uid).get(Source.CACHE).await()
+            } catch (e: Exception) {
+                try {
+                    adminsCollection.document(user.uid).get(Source.CACHE).await()
+                } catch (_: Exception) {
+                    null
+                }
+            }
+
+            if (adminDoc != null && adminDoc.exists()) {
+                val enabled = adminDoc.getBoolean("enabled") == true
+                if (enabled) {
+                    AppSettings.setAdminSession(user.uid, user.email ?: "")
+                    return true
+                } else {
+                    AppSettings.clearAdminSession()
+                    return false
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "Admin collection check notice: ${e.message}")
+        }
+
+        // Strictly NO fallback to /users/{uid}.role or users.isAdmin
+        AppSettings.clearAdminSession()
+        return false
+    }
+
+    /**
+     * Records administrative actions in Firestore for full transparency and accountability.
+     */
+    suspend fun logAudit(action: String, targetType: String, targetId: String, details: String) {
+        try {
+            val currentAdmin = auth.currentUser
+            val docRef = auditLogsCollection.document()
+            val log = AuditLog(
+                id = docRef.id,
+                actorUid = currentAdmin?.uid ?: "system",
+                adminUid = currentAdmin?.uid ?: "system",
+                adminEmail = currentAdmin?.email ?: "system",
+                action = action,
+                targetType = targetType,
+                targetId = targetId,
+                details = details,
+                createdAt = System.currentTimeMillis()
+            )
+            docRef.set(log, SetOptions.merge()).await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "Non-fatal audit log notice: ${e.message}")
+        }
+    }
+
+    // --- USERS MANAGEMENT ---
+
+    private val syncManager by lazy {
+        com.example.network.ResilientSyncManager.getInstance(com.example.MyApplication.instance)
+    }
+
+    suspend fun forceRefreshUsers() {
+        try {
+            usersCollection.get(com.google.firebase.firestore.Source.SERVER).await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "forceRefreshUsers server fetch notice: ${e.message}")
+        }
+    }
+
+    fun getAllUsers(): Flow<List<User>> = callbackFlow {
+        AppLogger.d("AdminRepository", "Listening for Firestore users updates (real-time with MetadataChanges)")
+        val listener = usersCollection.addSnapshotListener(com.google.firebase.firestore.MetadataChanges.INCLUDE) { snapshot, error ->
+            if (error != null) {
+                AppLogger.w("AdminRepository", "Firestore users listener non-fatal notification: ${error.message}")
+                if (error.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    close(error)
+                }
+                return@addSnapshotListener
+            }
+            val users = snapshot?.documents?.mapNotNull { doc ->
+                docToUser(doc)
+            } ?: emptyList()
+            AppLogger.d("AdminRepository", "Received ${users.size} users from Firestore (hasPendingSync=${snapshot?.metadata?.hasPendingWrites()})")
+            trySend(users.sortedByDescending { it.lastLoginTimestamp })
+        }
+        awaitClose { listener.remove() }
+    }.retryWhen { cause, attempt ->
+        AppLogger.w("AdminRepository", "Auto-reconnecting getAllUsers snapshot listener (attempt $attempt) after: ${cause.message}")
+        delay(minOf(1000L * (attempt + 1), 5000L))
+        true
+    }
+
+    fun getUser(userId: String): Flow<User?> = callbackFlow {
+        AppLogger.d("AdminRepository", "Listening for Firestore user $userId (real-time with MetadataChanges)")
+        val listener = usersCollection.document(userId).addSnapshotListener(com.google.firebase.firestore.MetadataChanges.INCLUDE) { snapshot, error ->
+            if (error != null) {
+                AppLogger.w("AdminRepository", "Firestore user($userId) non-fatal notification: ${error.message}")
+                if (error.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    close(error)
+                }
+                return@addSnapshotListener
+            }
+            val user = if (snapshot != null && snapshot.exists()) docToUser(snapshot) else null
+            trySend(user)
+        }
+        awaitClose { listener.remove() }
+    }.retryWhen { cause, attempt ->
+        AppLogger.w("AdminRepository", "Auto-reconnecting getUser($userId) listener (attempt $attempt) after: ${cause.message}")
+        delay(minOf(1000L * (attempt + 1), 5000L))
+        true
+    }
+
+    /**
+     * Resiliently writes user document updates using SetOptions.merge() and ResilientSyncManager.
+     * Guarantees that even with poor, weak, or fluctuating internet connection:
+     * 1. The change is written to local persistent disk cache immediately.
+     * 2. Snapshot listeners receive and render the update instantly.
+     * 3. The write is queued in ResilientSyncManager & Firestore persistent queue and syncs
+     *    automatically once the connection stabilizes without being dropped or cancelled.
+     */
+    suspend fun resilientSetUser(userId: String, updates: Map<String, Any?>, description: String = "Update user $userId") {
+        val opKey = "user_${userId}_${updates.keys.joinToString("_")}"
+        _pendingSyncKeys.update { it + opKey }
+        
+        // 1. Write to local Firestore cache immediately
+        val docRef = usersCollection.document(userId)
+        try {
+            docRef.set(updates, SetOptions.merge())
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "Immediate local cache update note: ${e.message}")
+        }
+
+        // 2. Delegate to Application-scoped ResilientSyncManager to guarantee completion
+        syncManager.enqueueWrite(
+            opId = opKey,
+            collection = FirebaseCollections.USERS,
+            documentId = userId,
+            payload = updates,
+            description = description,
+            onSuccess = {
+                _pendingSyncKeys.update { it - opKey }
+            },
+            onError = {
+                // Kept in pending queue, ResilientSyncManager will retry when connection stabilizes
+            }
+        )
+    }
+
+    suspend fun updateUser(userId: String, updates: Map<String, Any?>) {
+        // Comments are cancelled. Strip legacy flag and aliases from generic updates.
+        val filteredUpdates = updates.filterKeys { key ->
+            key.trim().lowercase().replace("_", "").replace("-", "") !in
+                setOf("comment", "comments", "cancomment")
+        }
+        if (filteredUpdates.isEmpty()) {
+            AppLogger.w("AdminRepository", "Ignored user update because no allowed fields remained after cancelled-feature filtering")
+            return
+        }
+        val updatesWithTimestamp = filteredUpdates.toMutableMap()
+        updatesWithTimestamp["updatedAt"] = System.currentTimeMillis()
+        resilientSetUser(userId, updatesWithTimestamp)
+        val formattedDetails = filteredUpdates.entries.joinToString(", ") { "${it.key}=${it.value}" }
+        logAudit(
+            action = "UPDATE_USER",
+            targetType = "USER",
+            targetId = userId,
+            details = "Updated fields: $formattedDetails"
+        )
+    }
+
+    /**
+     * Authoritative Global Account Ban (Phase C1).
+     * Suspends the entire user account, records explicit reason, and optional expiry millis.
+     * Strictly decoupled from individual feature restrictions.
+     */
+    suspend fun banAccount(userId: String, reason: String?, expiresAt: Long?) {
+        val now = System.currentTimeMillis()
+        val updates = hashMapOf<String, Any?>(
+            "isBanned" to true,
+            "banReason" to (reason?.trim()?.ifBlank { "Banned by administrator" } ?: "Banned by administrator"),
+            "banExpiresAt" to expiresAt,
+            "isActive" to false,
+            "updatedAt" to now
+        )
+        resilientSetUser(userId, updates)
+        val expiryDesc = if (expiresAt != null) "Expires at $expiresAt" else "Permanent"
+        logAudit(
+            action = "BAN_USER",
+            targetType = "USER",
+            targetId = userId,
+            details = "Account banned. Reason: ${reason ?: "N/A"}. Duration: $expiryDesc"
+        )
+    }
+
+    /**
+     * Authoritative Unban & Lift Suspension (Phase C1).
+     * Clears account-level ban, reason, expiration, and restores active state.
+     * Preserves existing user feature restrictions without accidental overwrites.
+     */
+    suspend fun unbanAccount(userId: String) {
+        val now = System.currentTimeMillis()
+        val updates = hashMapOf<String, Any?>(
+            "isBanned" to false,
+            "banReason" to null,
+            "banExpiresAt" to null,
+            "isActive" to true,
+            "updatedAt" to now
+        )
+        resilientSetUser(userId, updates)
+        logAudit(
+            action = "UNBAN_USER",
+            targetType = "USER",
+            targetId = userId,
+            details = "Account unbanned and restored to good standing"
+        )
+    }
+
+    /**
+     * Canonical Subscription Update (Phase 03A).
+     * Writes canonical fields (subscriptionTier, planId, durationDays, subscriptionStatus,
+     * subscriptionSource, subscriptionReferenceId, subscriptionStartedAt, subscriptionExpiresAt)
+     * and strictly synchronized compatibility mirrors (isPremium, isPro, plan, proPlan, proExpiresAt).
+     *
+     * Subscription Extension Rule:
+     * If user already has an active subscription, new expiration extends from existing expiration.
+     *
+     * Absolute Rule:
+     * Subscription benefit = REMOVE_ADS only.
+     * Technical permissions (allowedQuality, downloadLimit) are NEVER modified as a side-effect.
+     */
+    suspend fun updateSubscription(
+        userId: String,
+        tier: String,
+        durationDays: Int? = null,
+        planId: String? = null,
+        source: CanonicalSubscriptionSource = CanonicalSubscriptionSource.ADMIN_GRANT,
+        referenceId: String? = null,
+        status: String? = null
+    ) {
+        val canonicalTier = CanonicalSubscriptionTier.fromString(tier)
+        val isPaid = canonicalTier != CanonicalSubscriptionTier.FREE
+        val now = System.currentTimeMillis()
+
+        // Fetch current document to apply Extension Rule
+        val currentDoc = try {
+            usersCollection.document(userId).get().await()
+        } catch (e: Exception) {
+            null
+        }
+
+        val currentExpiresAt = if (currentDoc != null && currentDoc.exists()) {
+            if (currentDoc.contains("subscriptionExpiresAt")) {
+                extractTimestampMillis(currentDoc, "subscriptionExpiresAt", 0L).takeIf { it > 0L }
+            } else if (currentDoc.contains("proExpiresAt")) {
+                extractTimestampMillis(currentDoc, "proExpiresAt", 0L).takeIf { it > 0L }
+            } else null
+        } else null
+
+        val finalDurationDays = if (isPaid) {
+            durationDays ?: when (canonicalTier) {
+                CanonicalSubscriptionTier.PRO -> 30
+                CanonicalSubscriptionTier.PRO_LITE -> 7
+                CanonicalSubscriptionTier.FREE -> null
+            }
+        } else null
+
+        val finalPlanId = if (isPaid) {
+            planId ?: CanonicalPlanId.from(canonicalTier, finalDurationDays)
+        } else {
+            CanonicalPlanId.FREE
+        }
+
+        val finalExpiresAt: Long? = if (isPaid && finalDurationDays != null) {
+            val durationMillis = finalDurationDays.toLong() * 24 * 60 * 60 * 1000L
+            val baseTime = if (currentExpiresAt != null && currentExpiresAt > now) {
+                currentExpiresAt // Extend from existing active expiration!
+            } else {
+                now // Start from now
+            }
+            baseTime + durationMillis
+        } else null
+
+        val canonicalStatus = if (isPaid) {
+            status ?: CanonicalSubscriptionStatus.ACTIVE.name
+        } else {
+            CanonicalSubscriptionStatus.ACTIVE.name
+        }
+
+        val updates = hashMapOf<String, Any?>(
+            // Canonical Fields (Stored in UPPERCASE: FREE, PRO_LITE, PRO)
+            "subscriptionTier" to canonicalTier.name,
+            "planId" to finalPlanId,
+            "durationDays" to finalDurationDays,
+            "subscriptionStatus" to canonicalStatus,
+            "subscriptionSource" to source.name,
+            "subscriptionReferenceId" to referenceId,
+            "subscriptionStartedAt" to now,
+            "subscriptionExpiresAt" to finalExpiresAt,
+            // Compatibility Fields for Legacy Consumers
+            "isPremium" to isPaid,
+            "isPro" to isPaid,
+            "plan" to canonicalTier.name.lowercase(),
+            "proPlan" to canonicalTier.name.lowercase(),
+            "proExpiresAt" to finalExpiresAt,
+            "updatedAt" to now
+        )
+        // CRITICAL INVARIANT: allowedQuality and downloadLimit are completely UNTOUCHED here.
+        resilientSetUser(userId, updates)
+
+        val action = if (isPaid) "GRANT_SUBSCRIPTION" else "REVOKE_SUBSCRIPTION"
+        val expiryDesc = if (finalExpiresAt != null) "Expires at $finalExpiresAt" else "Lifetime / Indefinite"
+        logAudit(
+            action = action,
+            targetType = "USER",
+            targetId = userId,
+            details = "Subscription updated: Tier=${canonicalTier.name}, PlanId=$finalPlanId, Status=$canonicalStatus, Duration=${finalDurationDays ?: 0}d, Expiry=$expiryDesc, Source=${source.name}"
+        )
+    }
+
+    /**
+     * Authoritative Subscription Revocation (Phase 03A).
+     * Resets user to canonical FREE tier immediately.
+     */
+    suspend fun revokeSubscription(userId: String) {
+        updateSubscription(
+            userId = userId,
+            tier = CanonicalSubscriptionTier.FREE.name,
+            durationDays = null,
+            planId = CanonicalPlanId.FREE,
+            source = CanonicalSubscriptionSource.ADMIN_GRANT
+        )
+    }
+
+    /**
+     * Controlled Administrative Point Adjustment (Phase 03A).
+     * Atomically mutates cached balance and appends immutable ledger record.
+     */
+    suspend fun adjustUserPoints(
+        userId: String,
+        amount: Long,
+        reason: String,
+        actorUid: String,
+        actorEmail: String
+    ): PointTransaction {
+        require(userId.isNotBlank()) { "User ID cannot be blank" }
+        require(amount != 0L) { "Adjustment amount cannot be zero" }
+        require(reason.isNotBlank()) { "Adjustment reason cannot be blank" }
+
+        val userDocRef = usersCollection.document(userId)
+        val now = System.currentTimeMillis()
+        val txId = "tx_${now}_${java.util.UUID.randomUUID().toString().take(8)}"
+        val txDocRef = userDocRef.collection(FirebaseSubcollections.POINT_TRANSACTIONS).document(txId)
+
+        var createdTx: PointTransaction? = null
+
+        firestore.runTransaction { transaction ->
+            val snapshot = transaction.get(userDocRef)
+            if (!snapshot.exists()) {
+                throw IllegalArgumentException("User $userId does not exist")
+            }
+
+            val oldBalance = snapshot.getLong("pointsBalance") ?: 0L
+            val oldEarned = snapshot.getLong("totalPointsEarned")
+                ?: snapshot.getLong("pointsEarnedTotal")
+                ?: 0L
+            val oldSpent = snapshot.getLong("totalPointsSpent")
+                ?: snapshot.getLong("pointsSpentTotal")
+                ?: 0L
+
+            val newBalance = oldBalance + amount
+            if (newBalance < 0L) {
+                throw IllegalStateException("Adjustment rejected: Resulting balance cannot be negative ($newBalance)")
+            }
+            if (newBalance > 1_000_000L) {
+                throw IllegalStateException("Adjustment rejected: Resulting balance exceeds maximum ceiling of 1,000,000 points ($newBalance)")
+            }
+
+            val newEarned = if (amount > 0L) oldEarned + amount else oldEarned
+            val newSpent = if (amount < 0L) oldSpent + (-amount) else oldSpent
+
+            val txType = if (amount > 0L) PointTransactionType.ADMIN_GRANT.name else PointTransactionType.ADMIN_ADJUSTMENT.name
+
+            val txData = hashMapOf<String, Any?>(
+                "txId" to txId,
+                "userId" to userId,
+                "type" to txType,
+                "amount" to amount,
+                "balanceBefore" to oldBalance,
+                "balanceAfter" to newBalance,
+                "description" to reason.trim(),
+                "createdAt" to now,
+                "actorUid" to actorUid
+            )
+
+            transaction.set(txDocRef, txData)
+            transaction.update(userDocRef, mapOf(
+                "pointsBalance" to newBalance,
+                "totalPointsEarned" to newEarned,
+                "totalPointsSpent" to newSpent,
+                "pointsEarnedTotal" to newEarned,
+                "pointsSpentTotal" to newSpent,
+                "updatedAt" to now
+            ))
+
+            createdTx = PointTransaction(
+                txId = txId,
+                userId = userId,
+                type = txType,
+                amount = amount,
+                balanceBefore = oldBalance,
+                balanceAfter = newBalance,
+                description = reason.trim(),
+                createdAt = now,
+                actorUid = actorUid
+            )
+        }.await()
+
+        logAudit(
+            action = if (amount >= 0L) "ADMIN_POINTS_GRANT" else "ADMIN_POINTS_ADJUSTMENT",
+            targetType = "USER",
+            targetId = userId,
+            details = "Points adjustment by $actorEmail: $amount (Balance: ${createdTx?.balanceBefore} -> ${createdTx?.balanceAfter}). Reason: ${reason.trim()}"
+        )
+
+        return createdTx ?: throw IllegalStateException("Transaction failed to create point transaction record")
+    }
+
+    /**
+     * Realtime listener for User Point Transactions Ledger.
+     */
+    fun getUserPointTransactions(userId: String): Flow<List<PointTransaction>> = callbackFlow {
+        val listener = usersCollection.document(userId)
+            .collection(FirebaseSubcollections.POINT_TRANSACTIONS)
+            .orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(100)
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    AppLogger.w("AdminRepository", "Error listening to point transactions: ${error.message}")
+                    return@addSnapshotListener
+                }
+                val list = snapshot?.documents?.mapNotNull { doc ->
+                    try {
+                        PointTransaction(
+                            txId = doc.getString("txId") ?: doc.id,
+                            userId = doc.getString("userId") ?: userId,
+                            type = doc.getString("type") ?: PointTransactionType.ADMIN_ADJUSTMENT.name,
+                            amount = doc.getLong("amount") ?: 0L,
+                            balanceBefore = doc.getLong("balanceBefore") ?: 0L,
+                            balanceAfter = doc.getLong("balanceAfter") ?: 0L,
+                            referenceId = doc.getString("referenceId"),
+                            description = doc.getString("description") ?: "",
+                            createdAt = extractTimestampMillis(doc, "createdAt", 0L),
+                            actorUid = doc.getString("actorUid") ?: ""
+                        )
+                    } catch (e: Exception) {
+                        null
+                    }
+                } ?: emptyList()
+                trySend(list)
+            }
+        awaitClose { listener.remove() }
+    }
+
+    /**
+     * Realtime listener for Feature Control Configuration (/config/features).
+     */
+    fun getFeatureControlConfig(): Flow<FeatureControlConfig> = callbackFlow {
+        val docRef = configCollection.document(FirebaseConfigDocs.FEATURES)
+        val listener = docRef.addSnapshotListener { snapshot, error ->
+            if (error != null) {
+                AppLogger.w("AdminRepository", "Error listening to feature config: ${error.message}")
+                return@addSnapshotListener
+            }
+            if (snapshot != null && snapshot.exists()) {
+                try {
+                    val subs = parseFeatureItem(snapshot.get("subscriptions"))
+                    val pts = parseFeatureItem(snapshot.get("points"))
+                    val daily = parseFeatureItem(snapshot.get("dailyLogin"))
+                    val ads = parseFeatureItem(snapshot.get("rewardedAds"))
+                    val tasks = parseFeatureItem(snapshot.get("tasks"))
+                    val lb = parseFeatureItem(snapshot.get("leaderboard"))
+                    val updated = extractTimestampMillis(snapshot, "updatedAt", 0L)
+                    val by = snapshot.getString("updatedBy") ?: ""
+                    trySend(FeatureControlConfig(subs, pts, daily, ads, tasks, lb, updated, by))
+                } catch (e: Exception) {
+                    trySend(FeatureControlConfig())
+                }
+            } else {
+                trySend(FeatureControlConfig())
+            }
+        }
+        awaitClose { listener.remove() }
+    }
+
+    private fun parseFeatureItem(raw: Any?): FeatureItemConfig {
+        if (raw is Map<*, *>) {
+            val status = raw["status"]?.toString() ?: FeatureState.ACTIVE.name
+            val disabled = raw["disabledMessage"]?.toString() ?: "هذه الميزة غير متاحة حالياً"
+            val comingSoon = raw["comingSoonMessage"]?.toString() ?: "هذه الميزة ستضاف قريبًا"
+            return FeatureItemConfig(status, disabled, comingSoon)
+        }
+        return FeatureItemConfig()
+    }
+
+    suspend fun updateFeatureControl(
+        featureKey: String,
+        state: FeatureState,
+        comingSoonMsg: String? = null,
+        disabledMsg: String? = null
+    ) {
+        val normalizedFeatureKey = featureKey.trim().lowercase().replace("_", "").replace("-", "")
+        if (normalizedFeatureKey in setOf("comment", "comments", "cancomment")) {
+            throw IllegalArgumentException("Comments feature is cancelled and cannot be configured.")
+        }
+        val docRef = configCollection.document(FirebaseConfigDocs.FEATURES)
+        val now = System.currentTimeMillis()
+        val updates = hashMapOf<String, Any?>(
+            "$featureKey.status" to state.name,
+            "updatedAt" to now
+        )
+        if (comingSoonMsg != null) updates["$featureKey.comingSoonMessage"] = comingSoonMsg
+        if (disabledMsg != null) updates["$featureKey.disabledMessage"] = disabledMsg
+
+        docRef.set(updates, com.google.firebase.firestore.SetOptions.merge()).await()
+        logAudit(
+            action = "UPDATE_FEATURE_CONTROL",
+            targetType = "CONFIG",
+            targetId = "features",
+            details = "Updated feature $featureKey to ${state.name}"
+        )
+    }
+
+    /**
+     * Realtime listener for Economy Configuration (/config/economy).
+     */
+    fun getEconomyConfig(): Flow<EconomyConfig> = callbackFlow {
+        val docRef = configCollection.document(FirebaseConfigDocs.ECONOMY)
+        val listener = docRef.addSnapshotListener { snapshot, error ->
+            if (error != null) return@addSnapshotListener
+            if (snapshot != null && snapshot.exists()) {
+                try {
+                    val rawCosts = snapshot.get("redemptionCosts") as? Map<*, *>
+                    val costs = rawCosts?.mapNotNull { (k, v) ->
+                        if (k != null && v is Number) k.toString() to v.toLong() else null
+                    }?.toMap() ?: EconomyConfig().redemptionCosts
+
+                    val rawDaily = snapshot.get("dailyLoginRewards") as? List<*>
+                    val daily = rawDaily?.mapNotNull { (it as? Number)?.toLong() } ?: EconomyConfig().dailyLoginRewards
+
+                    val rewardedPts = snapshot.getLong("rewardedAdPoints") ?: 15L
+                    val dailyCap = snapshot.getLong("rewardedAdDailyCap")?.toInt() ?: 5
+                    val cooldown = snapshot.getLong("rewardedAdCooldownSeconds")?.toInt() ?: 300
+                    val updated = extractTimestampMillis(snapshot, "updatedAt", 0L)
+
+                    trySend(EconomyConfig(costs, daily, rewardedPts, dailyCap, cooldown, updated))
+                } catch (e: Exception) {
+                    trySend(EconomyConfig())
+                }
+            } else {
+                trySend(EconomyConfig())
+            }
+        }
+        awaitClose { listener.remove() }
+    }
+
+    suspend fun saveEconomyConfig(config: EconomyConfig) {
+        val docRef = configCollection.document(FirebaseConfigDocs.ECONOMY)
+        val now = System.currentTimeMillis()
+        val data = hashMapOf<String, Any?>(
+            "redemptionCosts" to config.redemptionCosts,
+            "dailyLoginRewards" to config.dailyLoginRewards,
+            "rewardedAdPoints" to config.rewardedAdPoints,
+            "rewardedAdDailyCap" to config.rewardedAdDailyCap,
+            "rewardedAdCooldownSeconds" to config.rewardedAdCooldownSeconds,
+            "updatedAt" to now
+        )
+        docRef.set(data, com.google.firebase.firestore.SetOptions.merge()).await()
+        logAudit(
+            action = "UPDATE_ECONOMY_CONFIG",
+            targetType = "CONFIG",
+            targetId = "economy",
+            details = "Updated economy configuration parameters"
+        )
+    }
+
+    /**
+     * Realtime listener for Reward Tasks Catalog (/reward_tasks).
+     */
+    fun getAllRewardTasks(): Flow<List<RewardTask>> = callbackFlow {
+        val listener = firestore.collection(FirebaseCollections.REWARD_TASKS)
+            .orderBy("createdAt", Query.Direction.DESCENDING)
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) return@addSnapshotListener
+                val list = snapshot?.documents?.mapNotNull { doc ->
+                    try {
+                        RewardTask(
+                            taskId = doc.getString("taskId") ?: doc.id,
+                            title = doc.getString("title") ?: "",
+                            description = doc.getString("description") ?: "",
+                            rewardPoints = doc.getLong("rewardPoints") ?: 50L,
+                            taskType = doc.getString("taskType") ?: "CUSTOM",
+                            actionUrl = doc.getString("actionUrl"),
+                            isActive = doc.getBoolean("isActive") ?: true,
+                            expiresAt = extractTimestampMillis(doc, "expiresAt", 0L).takeIf { it > 0L },
+                            createdAt = extractTimestampMillis(doc, "createdAt", 0L),
+                            updatedAt = extractTimestampMillis(doc, "updatedAt", 0L)
+                        )
+                    } catch (e: Exception) {
+                        null
+                    }
+                } ?: emptyList()
+                trySend(list)
+            }
+        awaitClose { listener.remove() }
+    }
+
+    suspend fun saveRewardTask(task: RewardTask) {
+        val docId = task.taskId.ifBlank { "task_${System.currentTimeMillis()}" }
+        val docRef = firestore.collection(FirebaseCollections.REWARD_TASKS).document(docId)
+        val now = System.currentTimeMillis()
+        val data = hashMapOf<String, Any?>(
+            "taskId" to docId,
+            "title" to task.title,
+            "description" to task.description,
+            "rewardPoints" to task.rewardPoints,
+            "taskType" to task.taskType,
+            "actionUrl" to task.actionUrl,
+            "isActive" to task.isActive,
+            "expiresAt" to task.expiresAt,
+            "createdAt" to if (task.createdAt > 0L) task.createdAt else now,
+            "updatedAt" to now
+        )
+        docRef.set(data, com.google.firebase.firestore.SetOptions.merge()).await()
+        logAudit(
+            action = "SAVE_REWARD_TASK",
+            targetType = "TASK",
+            targetId = docId,
+            details = "Saved reward task: ${task.title} (${task.rewardPoints} pts)"
+        )
+    }
+
+    suspend fun deleteRewardTask(taskId: String) {
+        firestore.collection(FirebaseCollections.REWARD_TASKS).document(taskId).delete().await()
+        logAudit(
+            action = "DELETE_REWARD_TASK",
+            targetType = "TASK",
+            targetId = taskId,
+            details = "Deleted reward task $taskId"
+        )
+    }
+
+    /**
+     * Realtime listener for Weekly Leaderboard (/leaderboard/weekly_current).
+     * Strictly READ-ONLY in Admin App (Phase 04B).
+     */
+    fun getWeeklyLeaderboard(): Flow<WeeklyLeaderboard> = callbackFlow {
+        val docRef = firestore.collection(FirebaseCollections.LEADERBOARD)
+            .document(com.example.contract.FirebaseLeaderboardDocs.WEEKLY_CURRENT)
+        val listener = docRef.addSnapshotListener { snapshot, error ->
+            if (error != null) {
+                AppLogger.w("AdminRepository", "Leaderboard listener notice: ${error.message}")
+                trySend(WeeklyLeaderboard())
+                return@addSnapshotListener
+            }
+            if (snapshot != null && snapshot.exists()) {
+                try {
+                    val cycleId = snapshot.getString("cycleId") ?: "WEEKLY_CURRENT"
+                    val updatedAt = extractTimestampMillis(snapshot, "updatedAt", 0L)
+                    val rawRankings = snapshot.get("rankings") as? List<*>
+                    val entries = rawRankings?.mapIndexedNotNull { idx, item ->
+                        if (item is Map<*, *>) {
+                            val rank = (item["rank"] as? Number)?.toInt() ?: (idx + 1)
+                            val uid = item["userId"]?.toString() ?: ""
+                            val name = item["displayName"]?.toString() ?: item["username"]?.toString() ?: "User #$rank"
+                            val pts = (item["points"] as? Number)?.toLong() ?: (item["weeklyEarnedPoints"] as? Number)?.toLong() ?: 0L
+                            val photo = item["photoUrl"]?.toString() ?: item["avatarUrl"]?.toString() ?: ""
+                            LeaderboardEntry(rank, uid, name, pts, photo)
+                        } else null
+                    } ?: emptyList()
+                    trySend(WeeklyLeaderboard(cycleId, updatedAt, entries))
+                } catch (e: Exception) {
+                    AppLogger.w("AdminRepository", "Failed to deserialize leaderboard: ${e.message}")
+                    trySend(WeeklyLeaderboard())
+                }
+            } else {
+                trySend(WeeklyLeaderboard())
+            }
+        }
+        awaitClose { listener.remove() }
+    }
+
+    /**
+     * Selective Feature Permission Toggle (Phase C1).
+     * Updates individual feature access without conflating with global account ban.
+     */
+    suspend fun updateFeaturePermission(userId: String, feature: String, allowed: Boolean) {
+        val normalizedFeature = feature.trim().lowercase().replace("_", "").replace("-", "")
+        // Comments are cancelled. Stop all legacy aliases before generating a Firestore update.
+        if (normalizedFeature in setOf("comment", "comments", "cancomment")) {
+            AppLogger.w("AdminRepository", "Comments feature is cancelled. Write operations for legacy comment permissions are disabled.")
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val updates = when (normalizedFeature) {
+            "watch" -> mapOf("canWatch" to allowed, "watchBan" to !allowed, "updatedAt" to now)
+            "download" -> mapOf("canDownload" to allowed, "downloadBan" to !allowed, "updatedAt" to now)
+            "chat" -> mapOf("canChat" to allowed, "chatBan" to !allowed, "updatedAt" to now)
+            "story" -> mapOf("canStory" to allowed, "storyBan" to !allowed, "updatedAt" to now)
+            "p2p" -> mapOf("canP2P" to allowed, "p2pBan" to !allowed, "updatedAt" to now)
+            "upload" -> mapOf("canUpload" to allowed, "updatedAt" to now)
+            "request" -> mapOf("canRequest" to allowed, "updatedAt" to now)
+            else -> mapOf(feature to allowed, "updatedAt" to now)
+        }
+        resilientSetUser(userId, updates)
+        logAudit(
+            action = "UPDATE_FEATURE_PERMISSION",
+            targetType = "USER",
+            targetId = userId,
+            details = "Permission $feature set to allowed=$allowed"
+        )
+    }
+
+    suspend fun setUserAdminRole(userId: String, email: String, isAdmin: Boolean) {
+        val currentAdminEmail = auth.currentUser?.email
+        val isCallerOwner = currentAdminEmail?.equals(OWNER_EMAIL, ignoreCase = true) == true
+        if (!isCallerOwner) {
+            throw IllegalStateException("Permission Denied: Only the verified project owner can grant or revoke administrator privileges.")
+        }
+        if (email.equals(OWNER_EMAIL, ignoreCase = true)) {
+            throw IllegalStateException("Administrative privileges of the project owner cannot be modified or revoked.")
+        }
+
+        val role = if (isAdmin) "admin" else "user"
+        val updates = mapOf(
+            "role" to role,
+            "updatedAt" to System.currentTimeMillis()
+        )
+        resilientSetUser(userId, updates, "Set admin role to $role for $email")
+        if (isAdmin) {
+            val adminDoc = AdminUser(
+                uid = userId,
+                email = email,
+                role = "admin",
+                enabled = true,
+                createdAt = System.currentTimeMillis()
+            )
+            adminsCollection.document(userId).set(adminDoc, SetOptions.merge()).await()
+        } else {
+            adminsCollection.document(userId).set(mapOf("enabled" to false), SetOptions.merge()).await()
+        }
+        logAudit(
+            action = if (isAdmin) "GRANT_ADMIN" else "REVOKE_ADMIN",
+            targetType = "USER",
+            targetId = userId,
+            details = "Set admin role to $role for $email"
+        )
+    }
+
+    suspend fun createUser(user: User): String {
+        val resolvedId = if (user.uid.isNotBlank()) user.uid else if (user.id.isNotBlank()) user.id else usersCollection.document().id
+        val docRef = usersCollection.document(resolvedId)
+        val now = System.currentTimeMillis()
+        val finalUser = user.copy(
+            uid = docRef.id,
+            id = docRef.id,
+            createdAt = if (user.createdAt == 0L) now else user.createdAt,
+            updatedAt = now,
+            lastLoginAt = if (user.lastLoginAt != 0L) user.lastLoginAt else user.lastLoginTimestamp,
+            lastLoginTimestamp = if (user.lastLoginAt != 0L) user.lastLoginAt else user.lastLoginTimestamp
+        )
+        // Set with merge to avoid wiping user-managed subcollections or fields if existing
+        docRef.set(finalUser, SetOptions.merge()).await()
+        logAudit(
+            action = "CREATE_USER",
+            targetType = "USER",
+            targetId = docRef.id,
+            details = "Created user: ${finalUser.username} (${finalUser.email})"
+        )
+        return docRef.id
+    }
+
+    suspend fun deleteUser(userId: String) {
+        if (userId.isBlank()) return
+        val targetUserDoc = try {
+            usersCollection.document(userId).get().await()
+        } catch (_: Exception) {
+            null
+        }
+        val targetEmail = targetUserDoc?.getString("email")
+        if (targetEmail?.equals(OWNER_EMAIL, ignoreCase = true) == true) {
+            throw IllegalStateException("The project owner account cannot be deleted.")
+        }
+
+        try {
+            usersCollection.document(userId).delete().await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "Delete user doc notice: ${e.message}")
+            try { usersCollection.document(userId).delete() } catch (_: Exception) {}
+        }
+        try {
+            adminsCollection.document(userId).delete().await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "Delete admin doc notice: ${e.message}")
+        }
+        logAudit(
+            action = "DELETE_USER",
+            targetType = "USER",
+            targetId = userId,
+            details = "Permanently deleted user: $userId"
+        )
+    }
+
+    // --- APP & GLOBAL CONFIG (MAINTENANCE, OTA, DRM) ---
+
+    fun getAppConfig(): Flow<AppConfig> = callbackFlow {
+        AppLogger.d("AdminRepository", "Listening for Firestore app config (real-time with MetadataChanges)")
+        val listener = configCollection.document(FirebaseConfigDocs.APP)
+            .addSnapshotListener(com.google.firebase.firestore.MetadataChanges.INCLUDE) { snapshot, error ->
+                if (error != null) {
+                    AppLogger.w("AdminRepository", "Firestore config non-fatal error: ${error.message}")
+                    if (error.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        close(error)
+                    }
+                    return@addSnapshotListener
+                }
+                if (snapshot != null && snapshot.exists()) {
+                    val config = try {
+                        snapshot.toObject(AppConfig::class.java) ?: AppConfig()
+                    } catch (e: Exception) {
+                        AppLogger.w("AdminRepository", "Error parsing AppConfig: ${e.message}")
+                        AppConfig()
+                    }
+                    trySend(config)
+                } else {
+                    // Canonical authoritative path is /config/app. If missing, emit default AppConfig (REM-CFG-01 / DISC-07).
+                    trySend(AppConfig())
+                }
+            }
+        awaitClose { listener.remove() }
+    }.retryWhen { cause, attempt ->
+        delay(minOf(1000L * (attempt + 1), 5000L))
+        true
+    }
+
+    suspend fun updateAppConfig(updates: Map<String, Any?>) {
+        val updatesWithTimestamp = updates.toMutableMap()
+        updatesWithTimestamp["updatedAt"] = System.currentTimeMillis()
+
+        // Canonical authoritative path: /config/app
+        configCollection.document(FirebaseConfigDocs.APP).set(updatesWithTimestamp, SetOptions.merge()).await()
+
+        logAudit(
+            action = "UPDATE_APP_CONFIG",
+            targetType = "CONFIG",
+            targetId = "app",
+            details = "Updated configs: ${updates.keys.joinToString(", ")}"
+        )
+    }
+
+    // Backward-compatibility alias
+    fun getGlobalConfig(): Flow<GlobalConfig> = getAppConfig()
+    suspend fun updateGlobalConfig(updates: Map<String, Any?>) = updateAppConfig(updates)
+
+    // --- CANONICAL APP UPDATES (/app_updates/{updateId}) ---
+
+    /**
+     * Realtime snapshot listener for all OTA releases in /app_updates.
+     * Ordered by versionCode descending.
+     */
+    fun getAppUpdates(): Flow<List<AppUpdate>> = callbackFlow {
+        AppLogger.d("AdminRepository", "Listening to /app_updates")
+        val listener = appUpdatesCollection
+            .orderBy("versionCode", Query.Direction.DESCENDING)
+            .addSnapshotListener(com.google.firebase.firestore.MetadataChanges.INCLUDE) { snapshot, error ->
+                if (error != null) {
+                    AppLogger.w("AdminRepository", "Non-fatal error listening to app_updates: ${error.message}")
+                    if (error.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        close(error)
+                    }
+                    return@addSnapshotListener
+                }
+                val list = snapshot?.documents?.mapNotNull { doc ->
+                    try {
+                        val item = doc.toObject(AppUpdate::class.java)
+                        val id = if (!item?.id.isNullOrBlank()) item!!.id else doc.id
+                        item?.copy(id = id)
+                    } catch (e: Exception) {
+                        AppLogger.w("AdminRepository", "Failed to deserialize app update ${doc.id}: ${e.message}")
+                        null
+                    }
+                } ?: emptyList()
+                trySend(list)
+            }
+        awaitClose { listener.remove() }
+    }.retryWhen { cause, attempt ->
+        delay(minOf(1000L * (attempt + 1), 5000L))
+        true
+    }
+
+    /**
+     * Creates or updates an authoritative release record at /app_updates/{updateId}.
+     */
+    suspend fun createOrUpdateAppUpdate(update: AppUpdate) {
+        val docId = if (update.id.isNotBlank()) update.id else if (update.versionCode > 0) update.versionCode.toString() else appUpdatesCollection.document().id
+        val currentAdmin = auth.currentUser
+        val finalUpdate = update.copy(
+            id = docId,
+            publishedBy = if (update.publishedBy.isNotBlank()) update.publishedBy else (currentAdmin?.email ?: currentAdmin?.uid ?: "admin"),
+            updatedAt = System.currentTimeMillis()
+        )
+        appUpdatesCollection.document(docId).set(finalUpdate, SetOptions.merge()).await()
+        logAudit(
+            action = "SAVE_APP_UPDATE",
+            targetType = "APP_UPDATE",
+            targetId = docId,
+            details = "Saved App Update v${update.versionName} (build: ${update.versionCode})"
+        )
+    }
+
+    /**
+     * Atomically publishes an app update release to both /app_updates/{docId}
+     * and /config/app via a Firestore write batch (DISC-05 / REM-UPD-01).
+     */
+    suspend fun publishAppUpdateComplete(update: AppUpdate, configUpdates: Map<String, Any?>? = null) {
+        val docId = if (update.id.isNotBlank()) update.id else if (update.versionCode > 0) update.versionCode.toString() else appUpdatesCollection.document().id
+        val currentAdmin = auth.currentUser
+        val finalUpdate = update.copy(
+            id = docId,
+            publishedBy = if (update.publishedBy.isNotBlank()) update.publishedBy else (currentAdmin?.email ?: currentAdmin?.uid ?: "admin"),
+            updatedAt = System.currentTimeMillis()
+        )
+
+        val mergedConfigUpdates = HashMap<String, Any?>()
+        if (configUpdates != null) {
+            mergedConfigUpdates.putAll(configUpdates)
+        }
+        mergedConfigUpdates["latestVersionCode"] = finalUpdate.versionCode
+        mergedConfigUpdates["latestVersionName"] = finalUpdate.versionName
+        mergedConfigUpdates["apkUrl"] = finalUpdate.apkUrl
+        mergedConfigUpdates["apkSha256"] = finalUpdate.apkSha256
+        mergedConfigUpdates["mandatoryUpdate"] = finalUpdate.mandatoryUpdate
+        mergedConfigUpdates["releaseNotes"] = finalUpdate.releaseNotes
+        if (finalUpdate.minVersionCode > 0) {
+            mergedConfigUpdates["minimumVersionCode"] = finalUpdate.minVersionCode
+        }
+        mergedConfigUpdates["updatedAt"] = System.currentTimeMillis()
+
+        val batch = firestore.batch()
+        batch.set(appUpdatesCollection.document(docId), finalUpdate, SetOptions.merge())
+        batch.set(configCollection.document(FirebaseConfigDocs.APP), mergedConfigUpdates, SetOptions.merge())
+        batch.commit().await()
+
+        logAudit(
+            action = "PUBLISH_APP_UPDATE_COMPOSITE",
+            targetType = "APP_UPDATE",
+            targetId = docId,
+            details = "Atomically published OTA update v${finalUpdate.versionName} (${finalUpdate.versionCode}) to /app_updates and /config/app"
+        )
+    }
+
+    /**
+     * Deletes an App Update record from /app_updates/{updateId}.
+     */
+    suspend fun deleteAppUpdate(updateId: String) {
+        if (updateId.isBlank()) return
+        appUpdatesCollection.document(updateId).delete().await()
+        logAudit(
+            action = "DELETE_APP_UPDATE",
+            targetType = "APP_UPDATE",
+            targetId = updateId,
+            details = "Deleted App Update record $updateId"
+        )
+    }
+
+    // --- NOTIFICATIONS ---
+
+    suspend fun sendNotification(request: NotificationRequest) {
+        val currentAdmin = auth.currentUser
+        val docRef = notificationsCollection.document()
+        val bodyText = request.body.ifBlank { request.message }
+        val canonicalTarget = when (request.targetType) {
+            NotificationRequest.TargetType.ALL -> "all"
+            NotificationRequest.TargetType.UID -> "user"
+            NotificationRequest.TargetType.PRO -> "pro"
+        }
+        val rawTarget = request.target.trim().lowercase()
+        val finalTarget = when (rawTarget) {
+            "all" -> "all"
+            "uid", "user" -> "user"
+            "pro" -> "pro"
+            else -> canonicalTarget
+        }
+        if (finalTarget == "user") {
+            require(!request.targetUid.isNullOrBlank()) {
+                "Target UID cannot be empty when notification target is an individual user."
+            }
+        }
+        val targetUidVal = if (finalTarget == "user") request.targetUid.trim() else null
+        val payload = hashMapOf<String, Any?>(
+            "id" to docRef.id,
+            "title" to request.title,
+            "body" to bodyText,
+            "message" to bodyText,
+            "type" to request.type,
+            "target" to finalTarget,
+            "targetType" to request.targetType.name,
+            "targetUid" to targetUidVal,
+            "createdBy" to (currentAdmin?.uid ?: "admin"),
+            "createdAt" to System.currentTimeMillis(),
+            "expiresAt" to request.expiresAt,
+            "isActive" to request.isActive,
+            "status" to "PENDING"
+        )
+        // Await the authoritative write before recording a successful dispatch audit.
+        docRef.set(payload, SetOptions.merge()).await()
+        logAudit(
+            action = "DISPATCH_NOTIFICATION",
+            targetType = "NOTIFICATION",
+            targetId = finalTarget,
+            details = "Title: ${request.title}, Audience: $finalTarget, Type: ${request.type}"
+        )
+    }
+
+    fun getRecentNotifications(): Flow<List<NotificationRequest>> = callbackFlow {
+        val listener = notificationsCollection.orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(25)
+            .addSnapshotListener(com.google.firebase.firestore.MetadataChanges.INCLUDE) { snapshot, error ->
+                if (error != null) {
+                    AppLogger.w("AdminRepository", "Firestore notifications non-fatal error: ${error.message}")
+                    if (error.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        close(error)
+                    }
+                    return@addSnapshotListener
+                }
+                val list = snapshot?.documents?.mapNotNull { doc ->
+                    try {
+                        val notif = doc.toObject(NotificationRequest::class.java)?.copy(id = doc.id)
+                        if (notif != null) {
+                            val bodyText = if (notif.body.isNotBlank()) notif.body else notif.message
+                            val targetVal = if (notif.target.isNotBlank()) notif.target.lowercase() else notif.targetType.canonicalTarget
+                            notif.copy(body = bodyText, message = bodyText, target = targetVal)
+                        } else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                } ?: emptyList()
+                trySend(list)
+            }
+        awaitClose { listener.remove() }
+    }.retryWhen { cause, attempt ->
+        delay(minOf(1000L * (attempt + 1), 5000L))
+        true
+    }
+
+    suspend fun deleteNotification(notificationId: String) {
+        if (notificationId.isBlank()) return
+        notificationsCollection.document(notificationId).delete().await()
+        logAudit(
+            action = "DELETE_NOTIFICATION",
+            targetType = "NOTIFICATION",
+            targetId = notificationId,
+            details = "Permanently deleted notification id: $notificationId"
+        )
+    }
+
+    suspend fun forceRefreshNotifications() {
+        try {
+            notificationsCollection.orderBy("createdAt", Query.Direction.DESCENDING)
+                .limit(25)
+                .get(com.google.firebase.firestore.Source.SERVER).await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "forceRefreshNotifications notice: ${e.message}")
+        }
+    }
+
+    suspend fun forceRefreshAuditLogs(limit: Long = 50) {
+        try {
+            auditLogsCollection.orderBy("createdAt", Query.Direction.DESCENDING)
+                .limit(limit)
+                .get(com.google.firebase.firestore.Source.SERVER).await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "forceRefreshAuditLogs notice: ${e.message}")
+        }
+    }
+
+    suspend fun forceRefreshReports() {
+        try {
+            reportsCollection.orderBy("createdAt", Query.Direction.DESCENDING)
+                .limit(50)
+                .get(com.google.firebase.firestore.Source.SERVER).await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "forceRefreshReports notice: ${e.message}")
+        }
+    }
+
+    suspend fun forceRefreshExtensions() {
+        try {
+            extensionsCollection.get(com.google.firebase.firestore.Source.SERVER).await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "forceRefreshExtensions notice: ${e.message}")
+        }
+    }
+
+    suspend fun forceRefreshAppConfig() {
+        try {
+            configCollection.document(FirebaseConfigDocs.APP)
+                .get(com.google.firebase.firestore.Source.SERVER).await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "forceRefreshAppConfig notice: ${e.message}")
+        }
+    }
+
+    // --- AUDIT LOGS ---
+
+    fun getAuditLogs(limit: Long = 50): Flow<List<AuditLog>> = callbackFlow {
+        val listener = auditLogsCollection.orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(limit)
+            .addSnapshotListener(com.google.firebase.firestore.MetadataChanges.INCLUDE) { snapshot, error ->
+                if (error != null) {
+                    AppLogger.w("AdminRepository", "Firestore audit logs non-fatal notice: ${error.message}")
+                    if (error.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        close(error)
+                    }
+                    return@addSnapshotListener
+                }
+                val list = snapshot?.documents?.mapNotNull { doc ->
+                    try {
+                        doc.toObject(AuditLog::class.java)?.copy(id = doc.id)
+                    } catch (e: Exception) {
+                        null
+                    }
+                } ?: emptyList()
+                trySend(list)
+            }
+        awaitClose { listener.remove() }
+    }.retryWhen { cause, attempt ->
+        delay(minOf(1000L * (attempt + 1), 5000L))
+        true
+    }
+
+    // --- EXTENSIONS MANAGEMENT ---
+
+    fun getExtensions(): Flow<List<ExtensionItem>> = callbackFlow {
+        val listener = extensionsCollection
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    AppLogger.e("AdminRepository", "Firestore extensions error: ${error.message}", error)
+                    close(error)
+                    return@addSnapshotListener
+                }
+                val list = snapshot?.documents?.mapNotNull { doc ->
+                    try {
+                        val docId = doc.id
+                        val name = doc.getString("name") ?: doc.getString("title") ?: docId
+                        val pkg = doc.getString("packageName") ?: doc.getString("package") ?: ""
+                        val vCode = when (val raw = doc.get("versionCode")) {
+                            is Number -> raw.toInt()
+                            is String -> raw.toIntOrNull() ?: 1
+                            else -> 1
+                        }
+                        val vName = doc.getString("versionName") ?: "1.0.0"
+                        val apkUrl = doc.getString("apkUrl") ?: doc.getString("url") ?: ""
+                        val apkSha = doc.getString("apkSha256") ?: doc.getString("sha256") ?: ""
+                        val minApp = when (val raw = doc.get("minAppVersionCode")) {
+                            is Number -> raw.toInt()
+                            is String -> raw.toIntOrNull() ?: 1
+                            else -> 1
+                        }
+                        val enabled = when (val raw = doc.get("enabled")) {
+                            is Boolean -> raw
+                            is String -> raw.equals("true", ignoreCase = true)
+                            is Number -> raw.toInt() != 0
+                            else -> true
+                        }
+                        val mandatory = when (val raw = doc.get("mandatory")) {
+                            is Boolean -> raw
+                            is String -> raw.equals("true", ignoreCase = true)
+                            is Number -> raw.toInt() != 0
+                            else -> false
+                        }
+                        val releaseNotes = doc.getString("releaseNotes") ?: ""
+                        val createdAt = (doc.get("createdAt") as? Number)?.toLong() ?: 0L
+                        val updatedAt = (doc.get("updatedAt") as? Number)?.toLong() ?: 0L
+
+                        ExtensionItem(
+                            id = docId,
+                            name = name,
+                            packageName = pkg,
+                            versionCode = vCode,
+                            versionName = vName,
+                            apkUrl = apkUrl,
+                            apkSha256 = apkSha,
+                            sha256 = apkSha,
+                            minAppVersionCode = minApp,
+                            enabled = enabled,
+                            mandatory = mandatory,
+                            releaseNotes = releaseNotes,
+                            createdAt = createdAt,
+                            updatedAt = updatedAt
+                        )
+                    } catch (e: Exception) {
+                        AppLogger.w("AdminRepository", "Failed to parse extension doc ${doc.id}: ${e.message}")
+                        null
+                    }
+                }?.sortedBy { it.name.lowercase() } ?: emptyList()
+                trySend(list)
+            }
+        awaitClose { listener.remove() }
+    }.retryWhen { cause, attempt ->
+        delay(minOf(1000L * (attempt + 1), 5000L))
+        true
+    }
+
+    suspend fun saveExtension(extension: ExtensionItem) {
+        val docRef = if (extension.id.isNotBlank()) extensionsCollection.document(extension.id) else extensionsCollection.document()
+        val now = System.currentTimeMillis()
+        val resolvedSha = extension.apkSha256.ifBlank { extension.sha256 }
+        val payload = extension.copy(
+            id = docRef.id,
+            apkSha256 = resolvedSha,
+            sha256 = resolvedSha,
+            createdAt = if (extension.createdAt == 0L) now else extension.createdAt,
+            updatedAt = now
+        )
+        docRef.set(payload, SetOptions.merge()).await()
+        logAudit(
+            action = "SAVE_EXTENSION",
+            targetType = "EXTENSION",
+            targetId = docRef.id,
+            details = "Saved extension: ${extension.name} v${extension.versionName}"
+        )
+    }
+
+    suspend fun deleteExtension(extensionId: String) {
+        if (extensionId.isBlank()) return
+        val cleanId = extensionId.trim()
+        try {
+            extensionsCollection.document(cleanId).delete().await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "Delete legacy extension notice: ${e.message}")
+        }
+        try {
+            firestore.collection(FirebaseCollections.MANAGED_EXTENSIONS).document(cleanId).delete().await()
+        } catch (e: Exception) {
+            AppLogger.w("AdminRepository", "Delete managed extension notice: ${e.message}")
+        }
+        try {
+            val q1 = extensionsCollection.whereEqualTo("scraperKey", cleanId).get().await()
+            for (doc in q1.documents) { doc.reference.delete() }
+            val q2 = firestore.collection(FirebaseCollections.MANAGED_EXTENSIONS).whereEqualTo("scraperKey", cleanId).get().await()
+            for (doc in q2.documents) { doc.reference.delete() }
+        } catch (e: Exception) {
+            // non-fatal
+        }
+        logAudit(
+            action = "DELETE_EXTENSION",
+            targetType = "EXTENSION",
+            targetId = cleanId,
+            details = "Deleted extension id: $cleanId"
+        )
+    }
+
+    // --- USER REPORTS MANAGEMENT ---
+
+    fun getReports(): Flow<List<UserReport>> = callbackFlow {
+        val listener = reportsCollection.orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(50)
+            .addSnapshotListener(com.google.firebase.firestore.MetadataChanges.INCLUDE) { snapshot, error ->
+                if (error != null) {
+                    AppLogger.w("AdminRepository", "Firestore reports non-fatal error: ${error.message}")
+                    if (error.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        close(error)
+                    }
+                    return@addSnapshotListener
+                }
+                val list = snapshot?.documents?.mapNotNull { doc ->
+                    try {
+                        val report = doc.toObject(UserReport::class.java)?.copy(id = doc.id)
+                        val created = extractTimestampMillis(doc, "createdAt", report?.createdAt ?: 0L)
+                        val resolved = if (doc.contains("resolvedAt")) extractTimestampMillis(doc, "resolvedAt", 0L) else null
+                        (report ?: UserReport()).copy(
+                            id = doc.id,
+                            createdAt = created,
+                            resolvedAt = resolved
+                        )
+                    } catch (e: Exception) {
+                        try {
+                            UserReport(
+                                id = doc.id,
+                                userId = doc.getString("userId") ?: "",
+                                userEmail = doc.getString("userEmail") ?: "",
+                                type = doc.getString("type") ?: "ISSUE",
+                                targetType = doc.getString("targetType") ?: "",
+                                targetId = doc.getString("targetId") ?: "",
+                                title = doc.getString("title") ?: "",
+                                description = doc.getString("description") ?: "",
+                                status = doc.getString("status") ?: "PENDING",
+                                resolutionNotes = doc.getString("resolutionNotes") ?: "",
+                                createdAt = extractTimestampMillis(doc, "createdAt", 0L),
+                                resolvedAt = if (doc.contains("resolvedAt")) extractTimestampMillis(doc, "resolvedAt", 0L) else null,
+                                resolvedBy = doc.getString("resolvedBy") ?: ""
+                            )
+                        } catch (inner: Exception) {
+                            null
+                        }
+                    }
+                } ?: emptyList()
+                trySend(list)
+            }
+        awaitClose { listener.remove() }
+    }.retryWhen { cause, attempt ->
+        delay(minOf(1000L * (attempt + 1), 5000L))
+        true
+    }
+
+    suspend fun updateReportStatus(reportId: String, status: String, notes: String) {
+        val currentAdmin = auth.currentUser
+        val updates = mapOf(
+            "status" to status,
+            "resolutionNotes" to notes,
+            "resolvedAt" to System.currentTimeMillis(),
+            "resolvedBy" to (currentAdmin?.uid ?: "admin")
+        )
+        reportsCollection.document(reportId).set(updates, SetOptions.merge()).await()
+        logAudit(
+            action = "RESOLVE_REPORT",
+            targetType = "REPORT",
+            targetId = reportId,
+            details = "Status changed to $status with notes: $notes"
+        )
+    }
+
+    suspend fun deleteReport(reportId: String) {
+        reportsCollection.document(reportId).delete().await()
+        logAudit(
+            action = "DELETE_REPORT",
+            targetType = "REPORT",
+            targetId = reportId,
+            details = "Deleted report id: $reportId"
+        )
+    }
+}
+
